@@ -282,10 +282,10 @@ void LoadSettings() {
     GetPrivateProfileStringW(L"AutoHack", L"overlay_cursor", L"1", buffer, 64, path.c_str());
     overlay = _wtoi(buffer);
 
-    GetPrivateProfileStringW(L"AutoHack", L"tap_hold_ms", L"8", buffer, 64, path.c_str());
+    GetPrivateProfileStringW(L"AutoHack", L"tap_hold_ms", L"16", buffer, 64, path.c_str());
     tapHold = _wtoi(buffer);
 
-    GetPrivateProfileStringW(L"AutoHack", L"tap_gap_ms", L"18", buffer, 64, path.c_str());
+    GetPrivateProfileStringW(L"AutoHack", L"tap_gap_ms", L"36", buffer, 64, path.c_str());
     tapGap = _wtoi(buffer);
 
     if ((overlay != 0 && overlay != 1)) {
