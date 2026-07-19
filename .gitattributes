@@ -1,5 +1,0 @@
-* text=auto
-*.cpp text eol=lf
-*.h text eol=lf
-*.ps1 text eol=crlf
-*.ini text eol=crlf
