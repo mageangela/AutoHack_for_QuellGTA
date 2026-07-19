@@ -620,176 +620,34 @@ static bool IsMinigamePageVisible() {
 }
 
 static bool IsSuccessPopupVisible() {
-    if (!g.circlesReady || g.roiW <= 0 || g.roiH <= 0) return false;
-
     ScreenShot shot;
     if (!CaptureScreen(shot)) return false;
 
-    int searchXScreen = g.roiX - static_cast<int>(std::lround(g.roiW * 0.09));
-    int searchYScreen = g.roiY - static_cast<int>(std::lround(g.roiH * 0.08));
-    int searchSizeScreen = static_cast<int>(std::lround(g.roiW * 1.26));
-    int searchX = ToShotX(shot, searchXScreen);
-    int searchY = ToShotY(shot, searchYScreen);
-    int searchSize = std::max(1, ToShotX(shot, searchSizeScreen));
+    int screenW = shot.w;
+    int screenH = shot.h;
 
-    // Use only native popup geometry. The user overlay can draw colored marks
-    // near this panel, so the detector ignores color cues and requires both
-    // the popup body and its left check-box icon to match.
-    int panelX = searchX - static_cast<int>(std::lround(searchSize * 0.02));
-    int panelY = searchY - static_cast<int>(std::lround(searchSize * 0.08));
-    int panelW = static_cast<int>(std::lround(searchSize * 1.34));
-    int panelH = static_cast<int>(std::lround(searchSize * 0.95));
+    int regionX = screenW * 28 / 100;
+    int regionY = screenH * 38 / 100;
+    int regionW = screenW * 44 / 100;
+    int regionH = screenH * 28 / 100;
 
-    struct Stats {
-        int samples = 0;
-        int bright = 0;
-        int dark = 0;
-        int cyan = 0;
-    };
-    auto isCyan = [](int r, int gch, int b) {
-        return gch > 120 && b > 120 && r < 110 && (gch - r) > 25 && (b - r) > 25;
-    };
-    auto sampleRect = [&](int left, int top, int right, int bottom, int step) {
-        left = std::max(0, std::min(left, shot.w - 1));
-        top = std::max(0, std::min(top, shot.h - 1));
-        right = std::max(left, std::min(right, shot.w - 1));
-        bottom = std::max(top, std::min(bottom, shot.h - 1));
+    int whitePixels = 0;
+    int totalPixels = 0;
+    int step = std::max(2, screenW / 200);
 
-        Stats s;
-        step = std::max(1, step);
-        for (int y = top; y <= bottom; y += step) {
-            const uint8_t* row = shot.pixels.data() + static_cast<size_t>(y) * shot.w * 4;
-            for (int x = left; x <= right; x += step) {
-                const uint8_t* p = row + x * 4;
-                int gray = GrayAt(p);
-                if (gray >= 175) ++s.bright;
-                if (gray <= 35) ++s.dark;
-                if (isCyan(p[2], p[1], p[0])) ++s.cyan;
-                ++s.samples;
-            }
+    for (int y = regionY; y < regionY + regionH; y += step) {
+        for (int x = regionX; x < regionX + regionW; x += step) {
+            if (x >= screenW || y >= screenH) continue;
+            const uint8_t* p = shot.pixels.data() + (static_cast<size_t>(y) * screenW + x) * 4;
+            int gray = (p[2] * 30 + p[1] * 59 + p[0] * 11) / 100;
+            if (gray >= 175) whitePixels++;
+            totalPixels++;
         }
-        return s;
-    };
-    auto pct = [](int count, int samples) {
-        return samples > 0 ? count * 100.0 / samples : 0.0;
-    };
+    }
 
-    int panelLeft = std::max(0, std::min(panelX, shot.w - 1));
-    int panelTop = std::max(0, std::min(panelY, shot.h - 1));
-    int panelRight = std::max(panelLeft, std::min(panelX + panelW, shot.w - 1));
-    int panelBottom = std::max(panelTop, std::min(panelY + panelH, shot.h - 1));
-    int regionW = panelRight - panelLeft + 1;
-    int regionH = panelBottom - panelTop + 1;
-    if (regionW < 80 || regionH < 80) return false;
+    int whitePct = totalPixels > 0 ? whitePixels * 100 / totalPixels : 0;
 
-    auto markPixel = [&](int x, int y, bool brightMark) {
-        const uint8_t* p = PixelAt(shot, x, y);
-        if (!p) return false;
-        int gray = GrayAt(p);
-        if (brightMark) {
-            return gray >= 160 && !isCyan(p[2], p[1], p[0]);
-        }
-        return gray <= 70;
-    };
-    auto verifySquare = [&](bool brightMark,
-                          int area,
-                          int minX,
-                          int minY,
-                          int maxX,
-                          int maxY) {
-        int bboxW = maxX - minX + 1;
-        int bboxH = maxY - minY + 1;
-        double side = std::max(bboxW, bboxH);
-        double aspect = bboxW / static_cast<double>(std::max(1, bboxH));
-        if (aspect < 0.72 || aspect > 1.32) return false;
-        if (side < panelW * 0.035 || side > panelW * 0.100) return false;
-        if (side < panelH * 0.035 || side > panelH * 0.110) return false;
-
-        double density = area * 100.0 / std::max(1, bboxW * bboxH);
-        if (density < 55.0 || density > 98.0) return false;
-
-        int pad = std::max(1, static_cast<int>(std::lround(side * 0.06)));
-        int squareLeft = minX - pad;
-        int squareTop = minY - pad;
-        int squareRight = maxX + pad;
-        int squareBottom = maxY + pad;
-        if (squareLeft < panelLeft || squareTop < panelTop || squareRight > panelRight || squareBottom > panelBottom) {
-            return false;
-        }
-
-        Stats square = sampleRect(squareLeft, squareTop, squareRight, squareBottom, 1);
-        double squareBright = pct(square.bright, square.samples);
-        double squareDark = pct(square.dark, square.samples);
-        double squareCyan = pct(square.cyan, square.samples);
-        bool squareOk = brightMark
-            ? (squareBright >= 58.0 && squareDark >= 2.0 && squareDark <= 38.0 && squareCyan <= 1.0)
-            : (squareDark >= 58.0 && squareBright >= 2.0 && squareBright <= 38.0 && squareCyan <= 1.0);
-        if (!squareOk) return false;
-
-        int popupLeft = static_cast<int>(std::lround(squareLeft - side * 2.20));
-        int popupTop = static_cast<int>(std::lround(squareTop - side * 0.85));
-        int popupRight = static_cast<int>(std::lround(squareLeft + side * 7.80));
-        int popupBottom = static_cast<int>(std::lround(squareTop + side * 2.05));
-        if (popupLeft < panelLeft || popupTop < panelTop || popupRight > panelRight || popupBottom > panelBottom) {
-            return false;
-        }
-
-        Stats popup = sampleRect(popupLeft, popupTop, popupRight, popupBottom,
-                                 std::max(1, static_cast<int>(std::lround(side / 28.0))));
-        double popupBright = pct(popup.bright, popup.samples);
-        double popupDark = pct(popup.dark, popup.samples);
-        double popupCyan = pct(popup.cyan, popup.samples);
-        return brightMark
-            ? (popupDark >= 40.0 && popupBright >= 3.0 && popupCyan <= 1.5)
-            : (popupBright >= 35.0 && popupDark >= 5.0 && popupCyan <= 1.5);
-    };
-    auto findContrastSquare = [&](bool brightMark) {
-        std::vector<uint8_t> seen(static_cast<size_t>(regionW) * regionH, 0);
-        std::vector<int> stack;
-        for (int ry = 0; ry < regionH; ++ry) {
-            for (int rx = 0; rx < regionW; ++rx) {
-                int start = ry * regionW + rx;
-                if (seen[start]) continue;
-                int absX = panelLeft + rx;
-                int absY = panelTop + ry;
-                if (!markPixel(absX, absY, brightMark)) continue;
-
-                int area = 0, minX = absX, minY = absY, maxX = absX, maxY = absY;
-                stack.clear();
-                stack.push_back(start);
-                seen[start] = 1;
-                while (!stack.empty()) {
-                    int pos = stack.back();
-                    stack.pop_back();
-                    int px = pos % regionW;
-                    int py = pos / regionW;
-                    int x = panelLeft + px;
-                    int y = panelTop + py;
-                    ++area;
-                    minX = std::min(minX, x);
-                    minY = std::min(minY, y);
-                    maxX = std::max(maxX, x);
-                    maxY = std::max(maxY, y);
-
-                    const int offsets[4][2] = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
-                    for (int i = 0; i < 4; ++i) {
-                        int nx = px + offsets[i][0];
-                        int ny = py + offsets[i][1];
-                        if (nx < 0 || ny < 0 || nx >= regionW || ny >= regionH) continue;
-                        int next = ny * regionW + nx;
-                        if (!seen[next] && markPixel(panelLeft + nx, panelTop + ny, brightMark)) {
-                            seen[next] = 1;
-                            stack.push_back(next);
-                        }
-                    }
-                }
-                if (area >= 20 && verifySquare(brightMark, area, minX, minY, maxX, maxY)) return true;
-            }
-        }
-        return false;
-    };
-
-    return findContrastSquare(true) || findContrastSquare(false);
+    return whitePct >= 15;
 }
 
 struct CaptureResult {

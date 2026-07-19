@@ -41,8 +41,8 @@ struct Frame {
 };
 
 struct TitleBars {
-    Rect timer, target, components, signals;
-    bool hasTimer = false, hasTarget = false, hasComponents = false, hasSignals = false;
+    Rect target, components, signals;
+    bool hasTarget = false, hasComponents = false, hasSignals = false;
 };
 
 struct RoiInfo {
@@ -525,73 +525,68 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
     int bestScore = -1000000000;
     TitleBars bestBars;
     Rect bestPanel{};
-    for (const auto& timer : bars) {
-        if (!(timer.cx < f.w * 0.50 && timer.rect.w > f.w * 0.16 && timer.rect.w < f.w * 0.38)) continue;
-        if (!(timer.cy > f.h * 0.05 && timer.cy < f.h * 0.20)) continue;
 
-        for (const auto& target : bars) {
-            if (&target == &timer) continue;
-            if (!(target.cx > timer.cx + f.w * 0.20 && target.rect.w > f.w * 0.24 && target.rect.w < f.w * 0.55)) continue;
-            if (!closeEnough(target.cy, timer.cy, f.h * 0.045)) continue;
+    for (const auto& target : bars) {
+        if (!(target.cx > f.w * 0.45 && target.cx < f.w * 0.75)) continue;  // Target 在右侧
+        if (!(target.cy > f.h * 0.05 && target.cy < f.h * 0.20)) continue;
+        if (!(target.rect.w > f.w * 0.24 && target.rect.w < f.w * 0.55)) continue;
 
-            for (const auto& components : bars) {
-                if (&components == &timer || &components == &target) continue;
-                if (!(components.cy > timer.cy + f.h * 0.07 && components.cy < timer.cy + f.h * 0.23)) continue;
-                if (!closeEnough(components.cx, timer.cx, f.w * 0.09)) continue;
-                if (!closeEnough(components.rect.w, timer.rect.w, f.w * 0.11)) continue;
+        for (const auto& components : bars) {
+            if (&components == &target) continue;
+            if (!(components.cx < target.cx - f.w * 0.10)) continue;
+            if (!(components.cy > target.cy + f.h * 0.07 && components.cy < target.cy + f.h * 0.23)) continue;
+            if (!(components.rect.w > f.w * 0.16 && components.rect.w < f.w * 0.38)) continue;
 
-                for (const auto& signals : bars) {
-                    if (&signals == &timer || &signals == &target || &signals == &components) continue;
-                    if (!(signals.cy > components.cy + f.h * 0.35 && signals.cy < f.h * 0.84)) continue;
-                    if (!closeEnough(signals.cx, target.cx, f.w * 0.12)) continue;
-                    if (!closeEnough(signals.rect.w, target.rect.w, f.w * 0.16)) continue;
+for (const auto& signals: bars) {
+    if (&signals == &target || &signals == &components) continue;
+    if (!closeEnough(signals.cx, target.cx, f.w * 0.12)) continue;
+    if (!(signals.cy > target.cy + f.h * 0.38 && signals.cy < f.h * 0.84)) continue;
+    if (!(signals.rect.w > f.w * 0.24 && signals.rect.w < f.w * 0.55)) continue;
 
-                    int left = std::min(timer.rect.x, components.rect.x) - scaledPx(f, 36);
-                    int top = std::min(timer.rect.y, target.rect.y) - scaledPx(f, 14);
-                    int panelRight = std::max(right(target.rect), right(signals.rect)) + scaledPx(f, 36);
-                    int panelBottom = bottom(signals.rect) + scaledPx(f, 170);
-                    Rect panel = clampRect({left, top, panelRight - left, panelBottom - top}, f.w, f.h);
-                    double panelAsp = panel.w / (double)std::max(1, panel.h);
-                    if (!(panel.w > f.w * 0.45 && panel.h > f.h * 0.45 && panelAsp > 1.0 && panelAsp < 2.0)) continue;
+    int left = std::min(components.rect.x, target.rect.x) - scaledPx(f, 36);
+    int top = std::min(components.rect.y, target.rect.y) - scaledPx(f, 14);
+    int panelRight = std::max(target.rect.x + target.rect.w, signals.rect.x + signals.rect.w) + scaledPx(f, 36);
+    int panelBottom = bottom(signals.rect) + scaledPx(f, 170);
+    Rect panel = clampRect({ left, top, panelRight - left, panelBottom - top }, f.w, f.h);
+    double panelAsp = panel.w / (double)std::max(1, panel.h);
+    if (!(panel.w > f.w * 0.45 && panel.h > f.h * 0.45 && panelAsp > 1.0 && panelAsp < 2.0)) continue;
 
-                    int score = timer.pixels + target.pixels + components.pixels + signals.pixels;
-                    score -= (int)std::lround(std::abs(timer.cy - target.cy) * 20.0);
-                    score -= (int)std::lround(std::abs(components.cx - timer.cx) * 3.0);
-                    score -= (int)std::lround(std::abs(signals.cx - target.cx) * 2.0);
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestBars.timer = timer.rect;
-                        bestBars.target = target.rect;
-                        bestBars.components = components.rect;
-                        bestBars.signals = signals.rect;
-                        bestBars.hasTimer = bestBars.hasTarget = bestBars.hasComponents = bestBars.hasSignals = true;
-                        bestPanel = panel;
-                    }
-                }
-            }
+    int score = target.pixels + components.pixels + signals.pixels;
+    score -= (int)std::lround(std::abs(components.cx - target.cx + f.w * 0.20) * 2.0);
+    score -= (int)std::lround(std::abs(signals.cx - target.cx) * 2.0);
+
+    if (score > bestScore) {
+        bestScore = score;
+        bestBars.target = target.rect;
+        bestBars.components = components.rect;
+        bestBars.signals = signals.rect;
+        bestBars.hasTarget = bestBars.hasComponents = bestBars.hasSignals = true;
+        bestPanel = panel;
+    }
+}
         }
     }
 
     if (bestScore > 0) {
         info.bars = bestBars;
         info.panel = bestPanel;
-    } else if (diag) {
+    }
+    else if (diag) {
         char buf[128];
         std::snprintf(buf, sizeof(buf), "title layout failed bars=%zu", bars.size());
         *diag = buf;
         return info;
-    };
+    }
 
-    info.isMinigame = info.bars.hasTimer && info.bars.hasTarget && info.bars.hasComponents && info.bars.hasSignals;
+    info.isMinigame = info.bars.hasTarget && info.bars.hasComponents && info.bars.hasSignals;
     if (diag) {
         char buf[256];
         std::snprintf(
             buf,
             sizeof(buf),
-            "panel=%s title_bars=%zu timer=%d target=%d components=%d signals=%d",
+            "panel=%s title_bars=%zu target=%d components=%d signals=%d",
             rectText(info.panel).c_str(),
             bars.size(),
-            info.bars.hasTimer ? 1 : 0,
             info.bars.hasTarget ? 1 : 0,
             info.bars.hasComponents ? 1 : 0,
             info.bars.hasSignals ? 1 : 0
@@ -644,14 +639,7 @@ static std::vector<int> edgeLinePeaks(const std::vector<int>& projection, int ba
     return chosen;
 }
 
-static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std::vector<Rect>& components, std::string* diag = nullptr) {
-    Rect cb = roi.bars.components;
-    Rect p = roi.panel;
-    int left = cb.x + (int)std::lround(cb.w * 0.08);
-    int right = cb.x + (int)std::lround(cb.w * 0.86);
-    int top = cb.y + cb.h + (int)std::lround(cb.h * 0.25);
-    int bottom = p.y + (int)std::lround(p.h * 0.84);
-    Rect search = clampRect({left, top, right - left, bottom - top}, f.w, f.h);
+static bool detectComponentBoxesByBorder(const Frame& f, const Rect& search, int cbWidth, std::vector<Rect>& components, std::string* diag = nullptr) {
     if (search.w <= 0 || search.h <= 0) {
         if (diag) *diag = "border search empty";
         return false;
@@ -677,12 +665,12 @@ static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std
     auto ys = edgeLinePeaks(horizontal, search.y, minDist, 0.45);
 
     std::vector<std::pair<int, int>> colPairs;
-    int minSide = std::max(scaledPx(f, 45), (int)std::lround(cb.w * 0.16));
-    int maxSide = std::max(minSide + 1, (int)std::lround(cb.w * 0.36));
+    int minSide = std::max(scaledPx(f, 45), (int)std::lround(cbWidth * 0.16));
+    int maxSide = std::max(minSide + 1, (int)std::lround(cbWidth * 0.36));
     for (int i = 0; i + 1 < (int)xs.size(); ++i) {
         int side = xs[i + 1] - xs[i];
         if (minSide <= side && side <= maxSide) {
-            colPairs.push_back({xs[i], xs[i + 1]});
+            colPairs.push_back({ xs[i], xs[i + 1] });
         }
     }
 
@@ -703,7 +691,7 @@ static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std
     for (int i = 0; i + 1 < (int)ys.size(); ++i) {
         int side = ys[i + 1] - ys[i];
         if (side >= avgW * 0.72 && side <= avgW * 1.35) {
-            rowPairs.push_back({ys[i], ys[i + 1]});
+            rowPairs.push_back({ ys[i], ys[i + 1] });
         }
     }
 
@@ -719,7 +707,7 @@ static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std
     components.clear();
     for (auto [y0, y1] : rowPairs) {
         for (auto [x0, x1] : colPairs) {
-            components.push_back(clampRect({x0, y0, x1 - x0 + 1, y1 - y0 + 1}, f.w, f.h));
+            components.push_back(clampRect({ x0, y0, x1 - x0 + 1, y1 - y0 + 1 }, f.w, f.h));
         }
     }
 
@@ -738,13 +726,25 @@ static bool detectRois(const Frame& f, const RoiInfo& roi, Rect& target, std::ve
     int targetBottom = sb.y - (int)std::lround(tb.h * 0.55);
     int targetLeft = tb.x + (int)std::lround(tb.w * 0.12);
     int targetRight = tb.x + (int)std::lround(tb.w * 0.72);
-    target = clampRect({targetLeft, targetTop, targetRight - targetLeft, targetBottom - targetTop}, f.w, f.h);
+    target = clampRect({ targetLeft, targetTop, targetRight - targetLeft, targetBottom - targetTop }, f.w, f.h);
+
+    int compLeft = cb.x + (int)std::lround(cb.w * 0.08);
+    int compRight = cb.x + (int)std::lround(cb.w * 0.86);
+    int compTop = cb.y + cb.h + (int)std::lround(cb.h * 0.25);
+    int compBottom = p.y + (int)std::lround(p.h * 0.84);
+
+    Rect search = clampRect({ compLeft, compTop, compRight - compLeft, compBottom - compTop }, f.w, f.h);
+    if (search.w <= 0 || search.h <= 0) {
+        if (diag) *diag = "component search empty";
+        return false;
+    }
 
     std::string compDiag;
-    if (!detectComponentBoxesByBorder(f, roi, components, &compDiag)) {
+    if (!detectComponentBoxesByBorder(f, search, cb.w, components, &compDiag)) {
         if (diag) *diag = "component ROI failed: " + compDiag;
         return false;
     }
+
     if (target.w <= 0 || target.h <= 0 || components.size() != 8) {
         if (diag) *diag = "component ROI failed: " + compDiag;
         return false;
@@ -753,8 +753,8 @@ static bool detectRois(const Frame& f, const RoiInfo& roi, Rect& target, std::ve
     if (diag) {
         char buf[192];
         std::snprintf(buf, sizeof(buf), "target=%s components=8 source=border %s",
-                      rectText(target).c_str(),
-                      compDiag.c_str());
+            rectText(target).c_str(),
+            compDiag.c_str());
         *diag = buf;
     }
     return true;
