@@ -143,13 +143,24 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="app\app_runtime.cpp" />
+    <ClCompile Include="app\app_ui.cpp" />
+    <ClCompile Include="capture\game_window.cpp" />
+    <ClCompile Include="games\choose_fingerprint_module.cpp" />
     <ClCompile Include="games\fingerprint_module.cpp" />
     <ClCompile Include="games\flashing_module.cpp" />
+    <ClCompile Include="games\fleeca_module.cpp" />
     <ClCompile Include="games\slider_module.cpp" />
+    <ClCompile Include="games\sort_fingerprint_module.cpp" />
+    <ClCompile Include="input\key_input.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="app\app_runtime.h" />
+    <ClInclude Include="app\app_ui.h" />
+    <ClInclude Include="capture\game_window.h" />
     <ClInclude Include="games\games.h" />
+    <ClInclude Include="input\key_input.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
