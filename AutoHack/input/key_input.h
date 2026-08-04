@@ -41,6 +41,7 @@ class Job {
   Job() = default;
   explicit Job(std::shared_ptr<State> state) : state_(std::move(state)) {}
   JobStatus Status() const;
+  std::chrono::steady_clock::time_point StartedAt() const;
   bool Pending() const { return Status() == JobStatus::Pending; }
   bool Succeeded() const { return Status() == JobStatus::Succeeded; }
   explicit operator bool() const { return state_ != nullptr; }

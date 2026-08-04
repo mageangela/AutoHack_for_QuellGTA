@@ -27,11 +27,14 @@ namespace {
 constexpr UINT WM_APP_LOG = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
 constexpr double kBaselineScreenHeightPx = 1080.0;
-constexpr double kEdgeActionWindowSeconds = 0.035;
+constexpr double kAnalysisIntervalSeconds = 1.0 / 60.0;
+constexpr double kDefaultEndToEndLatencySeconds = 0.060;
+constexpr double kMaximumCalibratedLatencySeconds = 0.500;
 constexpr double kEdgeTriggerZonePx = 80.0;
 constexpr double kMinUsableVelocityPxPerSec = 25.0;
-constexpr double kLateGraceSeconds = 0.010;
 constexpr double kInvalidPredictionSeconds = 999.0;
+constexpr double kYellowCenterStripHalfWidthPx = 8.0;
+constexpr double kYellowHalfOverlapPx = 72.0;
 constexpr int kOverlayMargin = 18;
 constexpr int kCursorSize = 64;
 constexpr int kCursorArrowTopOffset = 14;
@@ -40,6 +43,7 @@ constexpr int kCursorArrowRightOffset = 14;
 constexpr COLORREF kOverlayGreen = RGB(70, 255, 120);
 constexpr COLORREF kOverlayBrightGreen = RGB(80, 255, 140);
 constexpr COLORREF kOverlayTextGreen = RGB(145, 255, 175);
+constexpr COLORREF kOverlayWarningOrange = RGB(255, 174, 72);
 constexpr COLORREF kOverlayDeepGreen = RGB(18, 66, 42);
 constexpr COLORREF kOverlayBlack = RGB(10, 14, 20);
 
@@ -113,6 +117,8 @@ struct CaptureFrame {
 struct TrackSample {
   double center = 0.0;
   std::chrono::steady_clock::time_point time;
+  int topBottomY = 0;
+  int bottomTopY = 0;
 };
 
 struct TrackSlot {
@@ -120,6 +126,13 @@ struct TrackSlot {
   double lastCenter = 0.0;
   double velocity = 0.0;
   std::vector<TrackSample> history;
+};
+
+struct PostPressCalibration {
+  bool active = false;
+  int barIndex = -1;
+  gta5::input::Job inputJob;
+  std::chrono::steady_clock::time_point scheduledAt{};
 };
 
 struct PreviewBar {
@@ -145,7 +158,6 @@ struct PreviewState {
   std::wstring lastLog;
   double edgeError = 0.0;
   double triggerTimeSec = kInvalidPredictionSeconds;
-  double leadSec = 0.0;
   double velocity = 0.0;
   double scale = 1.0;
   int screenX = 0;
@@ -164,8 +176,8 @@ PreviewState g_preview;
 std::atomic<int> g_hudActiveBar{0};
 std::atomic<int> g_hudEdgePx{0};
 std::atomic<int> g_hudTtcMs{-1};
-std::atomic<int> g_hudDtMs{0};
-std::atomic<int> g_hudLeadMs{0};
+std::atomic<int> g_hudAnalysisHz10{0};
+std::atomic<int> g_hudEndToEndMs{-1};
 std::atomic<int> g_hudVelocityPx{0};
 std::atomic<int> g_hudScale100{100};
 std::atomic<bool> g_cursorVisible{false};
@@ -602,19 +614,26 @@ SearchCells BuildSearchCellsFromWhiteBars(const std::vector<BarMeasure>& bars, d
   return cells;
 }
 
-bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index, int cellLeftScreen, int cellRightScreen, double scale, YellowMeasure& out) {
+bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
+                            int cellLeftScreen, int cellRightScreen, double scale,
+                            int verticalHalf, YellowMeasure& out) {
   const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
   const int cellLeft = ToFrameX(f, cellLeftScreen);
   const int cellRight = ToFrameX(f, cellRightScreen);
   const int centerY = ToFrameY(f, red.centerY);
-  const int y1 = std::max(0, centerY - ScaledPx(320, localScale));
-  const int y2 = std::min(f.h - 1, centerY + ScaledPx(320, localScale));
+  int y1 = std::max(0, centerY - ScaledPx(320, localScale));
+  int y2 = std::min(f.h - 1, centerY + ScaledPx(320, localScale));
+  const int halfOverlap = ScaledPx(kYellowHalfOverlapPx, localScale);
+  if (verticalHalf < 0) y2 = std::min(y2, centerY + halfOverlap);
+  if (verticalHalf > 0) y1 = std::max(y1, centerY - halfOverlap);
   if (cellRight < 0 || cellLeft >= f.w || y2 <= y1) return false;
 
   auto& rowCount = g_rowCountScratch;
   rowCount.assign(f.h, 0);
-  const int scanX1 = std::clamp(cellLeft, 0, f.w - 1);
-  const int scanX2 = std::clamp(cellRight, 0, f.w - 1);
+  const int cellCenter = (cellLeft + cellRight) / 2;
+  const int stripHalfWidth = ScaledPx(kYellowCenterStripHalfWidthPx, localScale);
+  const int scanX1 = std::clamp(cellCenter - stripHalfWidth, 0, f.w - 1);
+  const int scanX2 = std::clamp(cellCenter + stripHalfWidth, 0, f.w - 1);
   for (int y = y1; y <= y2; ++y) {
     int count = 0;
     for (int x = scanX1; x <= scanX2; ++x) {
@@ -623,19 +642,20 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
     rowCount[y] = count;
   }
 
-  auto runs = GroupRuns(rowCount, y1, y2 + 1, ScaledPx(2, localScale), ScaledPx(6, localScale));
+  auto runs = GroupRuns(rowCount, y1, y2 + 1,
+                        ScaledPx(2, localScale), ScaledPx(1, localScale));
   if (runs.size() < 2) return false;
 
   std::pair<int, int> topRun{};
   std::pair<int, int> bottomRun{};
   int bestScore = -1000000;
+  bool foundPair = false;
   for (size_t i = 0; i + 1 < runs.size(); ++i) {
     for (size_t j = i + 1; j < runs.size(); ++j) {
       const int verticalGap = runs[j].first - runs[i].second - 1;
       const int topHeight = runs[i].second - runs[i].first + 1;
       const int bottomHeight = runs[j].second - runs[j].first + 1;
       if (verticalGap < ScaledPx(8, localScale) || verticalGap > ScaledPx(95, localScale)) continue;
-      if (topHeight < ScaledPx(10, localScale) || bottomHeight < ScaledPx(10, localScale)) continue;
 
       int yellowPixels = 0;
       for (int y = runs[i].first; y <= runs[i].second; ++y) yellowPixels += rowCount[y];
@@ -647,10 +667,11 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
         bestScore = score;
         topRun = runs[i];
         bottomRun = runs[j];
+        foundPair = true;
       }
     }
   }
-  if (bestScore < 0) return false;
+  if (!foundPair) return false;
 
   out.ok = true;
   out.index = index;
@@ -665,39 +686,90 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
 }
 
 YellowMeasure FindActiveYellowMeasure(const CaptureFrame& f, const RedBar& red, const SearchCells& cells, double scale,
+                                      int preferredVerticalHalf,
                                       const std::array<bool, 8>* skip = nullptr) {
   YellowMeasure best;
   if (!red.ok || !cells.ok || cells.xRanges.size() != 8) return best;
-  for (int i = 0; i < 8; ++i) {
-    if (skip && (*skip)[i]) continue;
-    YellowMeasure m;
-    if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first, cells.xRanges[i].second, scale, m)) {
-      if (!best.ok || m.score > best.score) best = m;
+  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
+  const int minimumScore = ScaledPx(20, localScale);
+  const int passCount = preferredVerticalHalf == 0 ? 1 : 2;
+  for (int pass = 0; pass < passCount && !best.ok; ++pass) {
+    const int verticalHalf = pass == 0 ? preferredVerticalHalf : -preferredVerticalHalf;
+    for (int i = 0; i < 8; ++i) {
+      if (skip && (*skip)[i]) continue;
+      YellowMeasure m;
+      if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first,
+                                 cells.xRanges[i].second, scale, verticalHalf, m)) {
+        if (m.score >= minimumScore && (!best.ok || m.score > best.score)) best = m;
+      }
     }
   }
-  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
-  if (best.ok && best.score < ScaledPx(20, localScale)) best.ok = false;
   return best;
 }
 
 YellowMeasure FindActiveYellowMeasureCandidates(const CaptureFrame& f, const RedBar& red, const SearchCells& cells,
                                                 const std::array<int, 3>& candidates, double scale,
+                                                int preferredVerticalHalf,
                                                 std::array<bool, 8>& scanned) {
   YellowMeasure best;
   scanned.fill(false);
   if (!red.ok || !cells.ok || cells.xRanges.size() != 8) return best;
-  for (int rawIndex : candidates) {
-    const int i = std::clamp(rawIndex, 0, 7);
-    if (scanned[i]) continue;
-    scanned[i] = true;
-    YellowMeasure m;
-    if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first, cells.xRanges[i].second, scale, m)) {
-      if (!best.ok || m.score > best.score) best = m;
+  for (int rawIndex : candidates) scanned[std::clamp(rawIndex, 0, 7)] = true;
+  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
+  const int minimumScore = ScaledPx(20, localScale);
+  const int passCount = preferredVerticalHalf == 0 ? 1 : 2;
+  for (int pass = 0; pass < passCount && !best.ok; ++pass) {
+    const int verticalHalf = pass == 0 ? preferredVerticalHalf : -preferredVerticalHalf;
+    for (int i = 0; i < 8; ++i) {
+      if (!scanned[i]) continue;
+      YellowMeasure m;
+      if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first,
+                                 cells.xRanges[i].second, scale, verticalHalf, m)) {
+        if (m.score >= minimumScore && (!best.ok || m.score > best.score)) best = m;
+      }
     }
   }
-  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
-  if (best.ok && best.score < ScaledPx(20, localScale)) best.ok = false;
   return best;
+}
+
+std::array<int, 3> YellowCandidateIndices(int lastYellowIndex, int expectedIndex) {
+  if (lastYellowIndex >= 0) {
+    return {lastYellowIndex, lastYellowIndex - 1, lastYellowIndex + 1};
+  }
+  return {expectedIndex, expectedIndex + 1, expectedIndex - 1};
+}
+
+RectI BuildYellowCaptureRegion(const RedBar& red, const SearchCells& cells,
+                               const std::array<int, 3>& candidates,
+                               double scale, int preferredVerticalHalf) {
+  int left = cells.xRanges[std::clamp(candidates[0], 0, 7)].first;
+  int right = cells.xRanges[std::clamp(candidates[0], 0, 7)].second;
+  for (int rawIndex : candidates) {
+    const int index = std::clamp(rawIndex, 0, 7);
+    left = std::min(left, cells.xRanges[index].first);
+    right = std::max(right, cells.xRanges[index].second);
+  }
+
+  const int horizontalMargin = ScaledPx(6, scale);
+  const int fullExtent = ScaledPx(320, scale);
+  const int halfOverlap = ScaledPx(kYellowHalfOverlapPx, scale);
+  int top = red.centerY - fullExtent;
+  int bottom = red.centerY + fullExtent;
+  if (preferredVerticalHalf < 0) bottom = red.centerY + halfOverlap;
+  if (preferredVerticalHalf > 0) top = red.centerY - halfOverlap;
+  return {left - horizontalMargin, top,
+          right - left + 1 + horizontalMargin * 2, bottom - top + 1};
+}
+
+RectI BuildFullYellowCaptureRegion(const RedBar& red, const SearchCells& cells,
+                                   double scale) {
+  const int horizontalMargin = ScaledPx(6, scale);
+  const int verticalExtent = ScaledPx(320, scale);
+  const int left = cells.xRanges.front().first - horizontalMargin;
+  const int right = cells.xRanges.back().second + horizontalMargin;
+  const int top = red.centerY - verticalExtent;
+  const int bottom = red.centerY + verticalExtent;
+  return {left, top, right - left + 1, bottom - top + 1};
 }
 
 FrameAnalysis AnalyzeFrame(const CaptureFrame& f, const std::vector<std::pair<int, int>>* knownXRuns = nullptr) {
@@ -813,14 +885,18 @@ double EstimateVelocity(const TrackSlot& slot) {
   return den > 1e-6 ? num / den : 0.0;
 }
 
-bool AddTrackSample(TrackSlot& slot, double observedError, std::chrono::steady_clock::time_point sampleTime) {
+bool AddTrackSample(TrackSlot& slot, double observedError,
+                    int topBottomY, int bottomTopY,
+                    std::chrono::steady_clock::time_point sampleTime) {
   slot.lastCenter = observedError;
   if (!slot.history.empty()) {
-    const double delta = std::abs(observedError - slot.history.back().center);
-    const double ageMs = std::chrono::duration<double, std::milli>(sampleTime - slot.history.back().time).count();
-    if (delta < 0.75 && ageMs < 80.0) return false;
+    const TrackSample& previous = slot.history.back();
+    const bool sameMarker = topBottomY == previous.topBottomY &&
+                            bottomTopY == previous.bottomTopY;
+    const bool sameQuantizedCenter = std::abs(observedError - previous.center) < 0.25;
+    if (sameMarker || sameQuantizedCenter) return false;
   }
-  slot.history.push_back({observedError, sampleTime});
+  slot.history.push_back({observedError, sampleTime, topBottomY, bottomTopY});
   while (slot.history.size() > 32) slot.history.erase(slot.history.begin());
   slot.velocity = EstimateVelocity(slot);
   return true;
@@ -830,9 +906,13 @@ bool IsUsableTiming(double seconds) {
   return std::isfinite(seconds) && seconds > 0.0 && seconds < 1.0;
 }
 
-double EstimateEdgeTriggerTime(double edgeError, double velocity, double scale) {
+double EstimateEdgeTriggerTime(double edgeError, double velocity, double scale,
+                               double lookaheadSeconds) {
   const double speed = std::abs(velocity);
-  if (std::abs(edgeError) > ScaledPx(kEdgeTriggerZonePx, scale) || speed < kMinUsableVelocityPxPerSec || edgeError * velocity >= 0.0) {
+  const double forecastZone = ScaledPx(kEdgeTriggerZonePx, scale) +
+                              speed * std::max(0.0, lookaheadSeconds);
+  if (std::abs(edgeError) > forecastZone ||
+      speed < kMinUsableVelocityPxPerSec || edgeError * velocity >= 0.0) {
     return kInvalidPredictionSeconds;
   }
   return std::abs(edgeError) / speed;
@@ -856,7 +936,6 @@ void UpdatePreview(const CaptureFrame& frame,
                    const YellowMeasure* yellow = nullptr,
                    double edgeError = 0.0,
                    double triggerTimeSec = kInvalidPredictionSeconds,
-                   double leadSec = 0.0,
                    double velocity = 0.0,
                    double scale = 1.0) {
   PreviewState next;
@@ -869,7 +948,6 @@ void UpdatePreview(const CaptureFrame& frame,
   next.status = status;
   next.edgeError = edgeError;
   next.triggerTimeSec = triggerTimeSec;
-  next.leadSec = leadSec;
   next.velocity = velocity;
   next.scale = scale;
   next.screenX = frame.x;
@@ -922,6 +1000,7 @@ void WorkerLoop() {
   int lastYellowIndex = -1;
   int trackedActive = -1;
   int yellowMissFrames = 0;
+  int preferredYellowHalf = 0;
   bool hasTrackingRegion = false;
   RectI trackingRegion{};
   RedBar lockedRedScreen{};
@@ -935,31 +1014,74 @@ void WorkerLoop() {
   bool activeFoundOnce = false;
   bool finishPendingAfter8 = false;
   auto finishConfirmStart = std::chrono::steady_clock::now();
-  int slowFrameStreak = 0;
+  PostPressCalibration postPress;
+  std::vector<double> calibratedLatencySamples;
+  calibratedLatencySamples.reserve(2);
+  calibratedLatencySamples.push_back(kDefaultEndToEndLatencySeconds);
+  double calibratedLatencySeconds = kDefaultEndToEndLatencySeconds;
+  g_hudEndToEndMs.store(
+      static_cast<int>(std::lround(calibratedLatencySeconds * 1000.0)),
+      std::memory_order_relaxed);
+  using AnalysisClock = std::chrono::steady_clock;
+  const auto analysisInterval = std::chrono::duration_cast<AnalysisClock::duration>(
+      std::chrono::duration<double>(kAnalysisIntervalSeconds));
+  auto nextAnalysisTime = AnalysisClock::now();
+  std::array<double, 30> analysisIntervalSamples{};
+  size_t analysisIntervalSampleCount = 0;
+  size_t analysisIntervalSampleIndex = 0;
+  double analysisIntervalSampleSum = 0.0;
+  double actualAnalysisIntervalSeconds = kAnalysisIntervalSeconds;
   CaptureFrame frame;
   while (!gta5::app::runtime::StopRequested()) {
-    const auto frameTime = std::chrono::steady_clock::now();
-    const int frameDtMs = static_cast<int>(std::round(std::chrono::duration<double, std::milli>(frameTime - lastFrameTime).count()));
-    lastFrameTime = frameTime;
-    if (frameDtMs > 30) {
-      ++slowFrameStreak;
-      if (slowFrameStreak >= 3) {
-        PostLog(L"Error: dt > 30ms for 3 consecutive frames; stopping.");
-        PostStatus(L"analysis latency too high; stopped");
-        gta5::app::runtime::RequestStop();
-        break;
-      }
-      std::this_thread::yield();
-      ++frameNo;
-      continue;
+    auto frameTime = AnalysisClock::now();
+    if (frameTime < nextAnalysisTime) {
+      std::this_thread::sleep_until(nextAnalysisTime);
+      frameTime = AnalysisClock::now();
     }
-    slowFrameStreak = 0;
-    if (!CaptureScreenRegion(frame, hasTrackingRegion ? &trackingRegion : nullptr, &sessionClient)) {
+    nextAnalysisTime += analysisInterval;
+    if (nextAnalysisTime <= frameTime) {
+      nextAnalysisTime = frameTime + analysisInterval;
+    }
+    const double frameIntervalSeconds =
+        std::chrono::duration<double>(frameTime - lastFrameTime).count();
+    const int frameDtMs = static_cast<int>(std::round(frameIntervalSeconds * 1000.0));
+    lastFrameTime = frameTime;
+    if (frameIntervalSeconds >= 0.001 && frameIntervalSeconds < 1.0) {
+      if (analysisIntervalSampleCount < analysisIntervalSamples.size()) {
+        ++analysisIntervalSampleCount;
+      } else {
+        analysisIntervalSampleSum -= analysisIntervalSamples[analysisIntervalSampleIndex];
+      }
+      analysisIntervalSamples[analysisIntervalSampleIndex] = frameIntervalSeconds;
+      analysisIntervalSampleSum += frameIntervalSeconds;
+      analysisIntervalSampleIndex =
+          (analysisIntervalSampleIndex + 1) % analysisIntervalSamples.size();
+      actualAnalysisIntervalSeconds =
+          analysisIntervalSampleSum / analysisIntervalSampleCount;
+      const double actualHz = 1.0 / actualAnalysisIntervalSeconds;
+      g_hudAnalysisHz10.store(static_cast<int>(std::lround(actualHz * 10.0)),
+                              std::memory_order_relaxed);
+    }
+    const std::array<int, 3> yellowCandidates = postPress.active
+        ? std::array<int, 3>{postPress.barIndex,
+                             std::min(7, postPress.barIndex + 1),
+                             std::max(0, postPress.barIndex - 1)}
+        : YellowCandidateIndices(lastYellowIndex, expectedIndex);
+    const int yellowSearchHalf = postPress.active ? 0 : preferredYellowHalf;
+    const bool focusedCapture = hasTrackingRegion && lockedRedScreen.ok &&
+                                searchCellsScreen.ok &&
+                                searchCellsScreen.xRanges.size() == 8;
+    if (focusedCapture) {
+      trackingRegion = BuildYellowCaptureRegion(lockedRedScreen, searchCellsScreen,
+                                                yellowCandidates, geometryScale,
+                                                yellowSearchHalf);
+    }
+    if (!CaptureScreenRegion(frame, focusedCapture ? &trackingRegion : nullptr, &sessionClient)) {
       PostStatus(L"capture failed");
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
-    const auto sampleTime = std::chrono::steady_clock::now();
+    auto sampleTime = std::chrono::steady_clock::now();
 
     const bool canUseLockedGeometry = hasTrackingRegion && lockedRedScreen.ok && lastBarsScreen.size() >= 8 && searchCellsScreen.ok;
     bool usedLockedGeometry = false;
@@ -1019,22 +1141,36 @@ void WorkerLoop() {
       minBarX = knownBarXRunsScreen.front().first;
       maxBarX = knownBarXRunsScreen.back().second;
     }
-    trackingRegion.x = minBarX - ScaledPx(45, geometryScale);
-    trackingRegion.y = a.red.centerY - ScaledPx(300, geometryScale);
-    trackingRegion.w = (maxBarX - minBarX) + ScaledPx(90, geometryScale);
-    trackingRegion.h = ScaledPx(600, geometryScale);
-
-    std::array<int, 3> yellowCandidates{};
-    if (lastYellowIndex >= 0) {
-      yellowCandidates = {lastYellowIndex, lastYellowIndex - 1, lastYellowIndex + 1};
-    } else {
-      yellowCandidates = {expectedIndex, expectedIndex + 1, expectedIndex - 1};
-    }
     std::array<bool, 8> scannedYellowCells{};
     YellowMeasure yellow = FindActiveYellowMeasureCandidates(frame, a.red, searchCellsScreen, yellowCandidates,
-                                                             geometryScale, scannedYellowCells);
-    if (!yellow.ok) {
-      yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen, geometryScale, &scannedYellowCells);
+                                                             geometryScale, yellowSearchHalf,
+                                                             scannedYellowCells);
+    if (!yellow.ok && focusedCapture) {
+      const RectI fallbackRegion =
+          BuildFullYellowCaptureRegion(a.red, searchCellsScreen, geometryScale);
+      if (CaptureScreenRegion(frame, &fallbackRegion, &sessionClient)) {
+        sampleTime = std::chrono::steady_clock::now();
+        FrameAnalysis fallbackAnalysis =
+            AnalyzeLockedGeometry(frame, lockedRedScreen, lastBarsScreen);
+        if (fallbackAnalysis.inMinigame) {
+          a = std::move(fallbackAnalysis);
+          yellow = FindActiveYellowMeasureCandidates(
+              frame, a.red, searchCellsScreen, yellowCandidates, geometryScale,
+              yellowSearchHalf, scannedYellowCells);
+        }
+      }
+    }
+    if (postPress.active && postPress.barIndex < 7) {
+      const int nextIndex = postPress.barIndex + 1;
+      const std::array<int, 3> nextOnly{nextIndex, nextIndex, nextIndex};
+      std::array<bool, 8> nextScanned{};
+      YellowMeasure nextYellow = FindActiveYellowMeasureCandidates(
+          frame, a.red, searchCellsScreen, nextOnly, geometryScale, 0, nextScanned);
+      if (nextYellow.ok) yellow = nextYellow;
+    }
+    if (!yellow.ok && !postPress.active) {
+      yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen, geometryScale,
+                                       preferredYellowHalf, &scannedYellowCells);
     }
     int active = yellow.ok ? yellow.index : -1;
     if (active >= 0 && active != trackedActive) {
@@ -1044,9 +1180,12 @@ void WorkerLoop() {
     if (yellow.ok) {
       yellowMissFrames = 0;
       lastYellowIndex = active;
+      if (yellow.gapCenterY < a.red.centerY) preferredYellowHalf = -1;
+      else if (yellow.gapCenterY > a.red.centerY) preferredYellowHalf = 1;
       tracks[active].valid = true;
       const double observedError = yellow.gapCenterY - a.red.centerY;
-      AddTrackSample(tracks[active], observedError, sampleTime);
+      AddTrackSample(tracks[active], observedError,
+                     yellow.topBottomY, yellow.bottomTopY, sampleTime);
       expectedIndex = active;
       int cursorBaseX = yellow.index >= 0 && yellow.index < static_cast<int>(a.bars.size())
                             ? a.bars[yellow.index].x1 - ScaledPx(16, geometryScale) - kCursorArrowRightOffset
@@ -1060,6 +1199,68 @@ void WorkerLoop() {
       g_cursorInZone.store(false, std::memory_order_relaxed);
       g_cursorBar.store(active + 1, std::memory_order_relaxed);
       g_cursorVisible.store(true, std::memory_order_relaxed);
+    }
+
+    if (postPress.active) {
+      const auto inputStartedAt = postPress.inputJob.StartedAt();
+      if (postPress.barIndex < 7 && active == postPress.barIndex + 1 &&
+          inputStartedAt != AnalysisClock::time_point{} &&
+          sampleTime >= inputStartedAt) {
+        const double measuredLatencySeconds =
+            std::chrono::duration<double>(sampleTime - inputStartedAt).count();
+        const int completedBar = postPress.barIndex;
+        if (measuredLatencySeconds > 0.0 &&
+            measuredLatencySeconds <= kMaximumCalibratedLatencySeconds) {
+          if (calibratedLatencySamples.size() == 2) {
+            calibratedLatencySamples.erase(calibratedLatencySamples.begin());
+          }
+          calibratedLatencySamples.push_back(measuredLatencySeconds);
+          double latencySum = 0.0;
+          for (double sample : calibratedLatencySamples) latencySum += sample;
+          calibratedLatencySeconds = latencySum / calibratedLatencySamples.size();
+          g_hudEndToEndMs.store(
+              static_cast<int>(std::lround(calibratedLatencySeconds * 1000.0)),
+              std::memory_order_relaxed);
+
+          std::wstringstream calibrationLog;
+          calibrationLog << L"E2E calibrated: bar=" << (completedBar + 1)
+                         << L" next=" << (active + 1)
+                         << L" sample="
+                         << static_cast<int>(std::lround(measuredLatencySeconds * 1000.0))
+                         << L"ms average="
+                         << static_cast<int>(std::lround(calibratedLatencySeconds * 1000.0))
+                         << L"ms";
+          PostLog(calibrationLog.str());
+        }
+
+        postPress = {};
+        ResetTrack(tracks[completedBar]);
+        trackedActive = -1;
+        expectedIndex = completedBar + 1;
+        lastYellowIndex = -1;
+        preferredYellowHalf = 0;
+        ++frameNo;
+        continue;
+      }
+
+      const auto timeoutStart = inputStartedAt != AnalysisClock::time_point{}
+                                    ? inputStartedAt
+                                    : postPress.scheduledAt;
+      if (AnalysisClock::now() - timeoutStart > std::chrono::milliseconds(650)) {
+        const int timedOutBar = postPress.barIndex;
+        std::wstringstream timeoutLog;
+        timeoutLog << L"E2E calibration timeout: bar=" << (timedOutBar + 1)
+                   << L"; resuming tracking";
+        PostLog(timeoutLog.str());
+        postPress = {};
+        ResetTrack(tracks[timedOutBar]);
+        trackedActive = -1;
+        expectedIndex = timedOutBar;
+        lastYellowIndex = -1;
+        preferredYellowHalf = 0;
+        ++frameNo;
+        continue;
+      }
     }
 
     if (active == -1) {
@@ -1080,7 +1281,8 @@ void WorkerLoop() {
       if (++yellowMissFrames >= 3) lastYellowIndex = -1;
       if (yellowMissFrames >= 3) trackedActive = -1;
       PostStatus(L"waiting yellow outline");
-      UpdatePreview(frame, a, tracks, -1, L"waiting yellow outline", nullptr, 0.0, kInvalidPredictionSeconds, 0.0, 0.0, geometryScale);
+      UpdatePreview(frame, a, tracks, -1, L"waiting yellow outline", nullptr,
+                    0.0, kInvalidPredictionSeconds, 0.0, geometryScale);
       if (lastLoggedActive != -1 && frameNo > 12) {
         PostLog(L"yellow outline not found");
         lastLoggedActive = -1;
@@ -1113,35 +1315,41 @@ void WorkerLoop() {
     const double error = tracks[active].lastCenter;
     const double velocity = tracks[active].velocity;
     const double edgeError = EdgeTriggerError(yellow, a.red, velocity);
+    const double analysisHorizonSec = actualAnalysisIntervalSeconds;
+    const double appliedLeadSec = calibratedLatencySeconds;
+    const double forecastEdgeError = edgeError + velocity * analysisHorizonSec;
     const int cursorTargetY = velocity >= 0.0 ? a.red.y1 : a.red.y2;
     g_cursorTargetY.store(cursorTargetY, std::memory_order_relaxed);
-    g_cursorInZone.store(std::abs(edgeError) <= ScaledPx(kEdgeTriggerZonePx * 2.0, geometryScale), std::memory_order_relaxed);
-    const double triggerTimeSec = EstimateEdgeTriggerTime(edgeError, velocity, geometryScale);
+    g_cursorInZone.store(
+        std::abs(forecastEdgeError) <= ScaledPx(kEdgeTriggerZonePx * 2.0, geometryScale) ||
+            edgeError * forecastEdgeError <= 0.0,
+        std::memory_order_relaxed);
+    const double triggerTimeSec =
+        EstimateEdgeTriggerTime(edgeError, velocity, geometryScale, analysisHorizonSec);
     const auto now = std::chrono::steady_clock::now();
     const bool cooledDown = now - lastEnter > std::chrono::milliseconds(170);
     const bool modelReady = tracks[active].history.size() >= 2;
     const bool triggerReady = modelReady && IsUsableTiming(triggerTimeSec);
-    const double leadSec = std::clamp(frameDtMs / 1000.0, 0.0, kEdgeActionWindowSeconds);
-    const double pressDelaySec = triggerTimeSec - leadSec;
+    const double scheduledDelaySec = triggerTimeSec - appliedLeadSec;
     const int triggerMs = IsUsableTiming(triggerTimeSec) ? static_cast<int>(std::round(triggerTimeSec * 1000.0)) : -1;
-    const int leadMs = static_cast<int>(std::round(leadSec * 1000.0));
     if (now - lastUiUpdate >= std::chrono::milliseconds(50)) {
       g_hudActiveBar.store(active + 1, std::memory_order_relaxed);
       g_hudEdgePx.store(static_cast<int>(std::round(edgeError)), std::memory_order_relaxed);
       g_hudTtcMs.store(triggerMs, std::memory_order_relaxed);
-      g_hudDtMs.store(frameDtMs, std::memory_order_relaxed);
-      g_hudLeadMs.store(leadMs, std::memory_order_relaxed);
       g_hudVelocityPx.store(static_cast<int>(std::round(velocity)), std::memory_order_relaxed);
       g_hudScale100.store(static_cast<int>(std::round(geometryScale * 100.0)), std::memory_order_relaxed);
       UpdatePreview(frame, a, tracks, active, a.minigameStatus.empty() ? L"in minigame" : a.minigameStatus,
-                    &yellow, edgeError, triggerTimeSec, leadSec, velocity, geometryScale);
+                    &yellow, edgeError, triggerTimeSec, velocity, geometryScale);
       lastUiUpdate = now;
     }
-    const bool pressReady = triggerReady && cooledDown && pressDelaySec <= kEdgeActionWindowSeconds && pressDelaySec >= -std::max(kLateGraceSeconds, leadSec);
+    const bool pressReady = triggerReady && cooledDown;
     if (pressReady) {
       const auto predictedAt = sampleTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                            std::chrono::duration<double>(pressDelaySec));
-      gta5::input::QueueImmediate({0x1C, false}, predictedAt);
+                                            std::chrono::duration<double>(scheduledDelaySec));
+      postPress.active = true;
+      postPress.barIndex = active;
+      postPress.scheduledAt = predictedAt;
+      postPress.inputJob = gta5::input::QueueImmediate({0x1C, false}, predictedAt);
       lastEnter = predictedAt;
       std::wstringstream ss;
       ss << L"Press Enter: bar=" << (active + 1) << L" schedErr=" << static_cast<int>(std::round(error)) << L"px";
@@ -1151,24 +1359,20 @@ void WorkerLoop() {
       timingLog << L"Timing: bar=" << (active + 1)
                 << L" edge=" << static_cast<int>(std::round(edgeError))
                 << L"px copy=" << triggerMs
-                << L" lead=" << leadMs
-                << L"ms vel=" << static_cast<int>(std::round(velocity))
+                << L" lead=" << static_cast<int>(std::lround(appliedLeadSec * 1000.0))
+                << L"ms(e2e)"
+                << L" vel=" << static_cast<int>(std::round(velocity))
                 << L"px/s dt=" << frameDtMs
                 << L"ms";
       PostLog(timingLog.str());
-      ResetTrack(tracks[active]);
-      trackedActive = -1;
-      expectedIndex = std::min(7, active + 1);
-      lastYellowIndex = -1;
       if (active == 7) {
         finishPendingAfter8 = true;
-        finishConfirmStart = std::chrono::steady_clock::now();
+        finishConfirmStart = predictedAt;
       }
       ++frameNo;
       continue;
     }
 
-    std::this_thread::yield();
     ++frameNo;
   }
 
@@ -1209,8 +1413,8 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         maxX = std::max(maxX, b.x2);
       }
 
-      const int infoW = ScaledPx(96, state.scale);
-      const int infoH = ScaledPx(44, state.scale);
+      const int infoW = ScaledPx(104, state.scale);
+      const int infoH = ScaledPx(62, state.scale);
       const int gap = ScaledPx(12, state.scale);
       const int pad = ScaledPx(12, state.scale);
       const int infoRight = state.red.x1 - gap;
@@ -1286,23 +1490,32 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RoundRect(hdc, mark.left, mark.top, mark.right, mark.bottom, markerH, markerH);
       }
 
-      const int infoW = ScaledPx(96, state.scale);
-      const int infoH = ScaledPx(44, state.scale);
+      const int infoW = ScaledPx(104, state.scale);
+      const int infoH = ScaledPx(62, state.scale);
       const int gap = ScaledPx(12, state.scale);
       const int infoRight = state.red.x1 - gap - wr.left;
       const int infoCenterY = state.red.centerY - wr.top;
-      const int dtMs = g_hudDtMs.load(std::memory_order_relaxed);
+      const int analysisHz10 = g_hudAnalysisHz10.load(std::memory_order_relaxed);
       const int ttcMs = g_hudTtcMs.load(std::memory_order_relaxed);
-      std::wstring dtText = L"dt " + std::to_wstring(dtMs) + L"ms";
+      const int endToEndMs = g_hudEndToEndMs.load(std::memory_order_relaxed);
+      std::wstring hzText = L"hz " + std::to_wstring(analysisHz10 / 10) + L"." +
+                            std::to_wstring(std::abs(analysisHz10 % 10));
       std::wstring ttcText = L"ttc " + std::to_wstring(ttcMs) + L"ms";
+      std::wstring endToEndText = endToEndMs >= 0
+                                      ? L"e2e " + std::to_wstring(endToEndMs) + L"ms"
+                                      : L"e2e --";
       RECT info{infoRight - infoW, infoCenterY - infoH / 2, infoRight, infoCenterY + infoH / 2};
       SelectObject(hdc, infoBrush);
       SelectObject(hdc, activePen);
       RoundRect(hdc, info.left, info.top, info.right, info.bottom, 8, 8);
-      SetTextColor(hdc, kOverlayTextGreen);
       const int textX = info.left + ScaledPx(8, state.scale);
-      TextOutW(hdc, textX, info.top + ScaledPx(5, state.scale), dtText.c_str(), static_cast<int>(dtText.size()));
+      SetTextColor(hdc, analysisHz10 > 0 && analysisHz10 < 300
+                            ? kOverlayWarningOrange : kOverlayTextGreen);
+      TextOutW(hdc, textX, info.top + ScaledPx(5, state.scale), hzText.c_str(), static_cast<int>(hzText.size()));
+      SetTextColor(hdc, kOverlayTextGreen);
       TextOutW(hdc, textX, info.top + ScaledPx(23, state.scale), ttcText.c_str(), static_cast<int>(ttcText.size()));
+      TextOutW(hdc, textX, info.top + ScaledPx(41, state.scale), endToEndText.c_str(),
+               static_cast<int>(endToEndText.size()));
 
       SelectObject(hdc, oldBrush);
       SelectObject(hdc, oldPen);
@@ -1441,7 +1654,8 @@ void ClearOverlayState() {
   g_cursorInZone.store(false, std::memory_order_relaxed);
   g_hudActiveBar.store(0, std::memory_order_relaxed);
   g_hudTtcMs.store(-1, std::memory_order_relaxed);
-  g_hudDtMs.store(0, std::memory_order_relaxed);
+  g_hudAnalysisHz10.store(0, std::memory_order_relaxed);
+  g_hudEndToEndMs.store(-1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_previewMutex);
     const std::wstring status = g_preview.status;

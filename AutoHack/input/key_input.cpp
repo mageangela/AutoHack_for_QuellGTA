@@ -13,6 +13,7 @@ namespace gta5::input {
 
 struct Job::State {
   std::atomic<JobStatus> status{JobStatus::Pending};
+  std::atomic<long long> startedAtNs{0};
 };
 
 namespace {
@@ -132,6 +133,13 @@ class Dispatcher {
           result = JobStatus::Failed;
           break;
         }
+        const auto startedAtNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     Clock::now().time_since_epoch())
+                                     .count();
+        long long expectedStart = 0;
+        request.state->startedAtNs.compare_exchange_strong(
+            expectedStart, startedAtNs,
+            std::memory_order_release, std::memory_order_relaxed);
 
         const bool stillActive = WaitUntil(Clock::now() + stroke.hold, request.generation);
         const bool released = SendKey(stroke.key, true);
@@ -203,6 +211,13 @@ Key Key::FromVirtualKey(WORD virtualKey) {
 
 JobStatus Job::Status() const {
   return state_ ? state_->status.load(std::memory_order_acquire) : JobStatus::Invalid;
+}
+
+std::chrono::steady_clock::time_point Job::StartedAt() const {
+  if (!state_) return {};
+  const long long ns = state_->startedAtNs.load(std::memory_order_acquire);
+  if (ns <= 0) return {};
+  return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ns));
 }
 
 void ConfigureSequenceTiming(std::chrono::milliseconds hold,

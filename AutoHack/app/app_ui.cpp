@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #include "app_ui.h"
 
 #include <windowsx.h>

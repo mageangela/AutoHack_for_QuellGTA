@@ -171,9 +171,15 @@ bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const 
     ReleaseDC(nullptr, screen);
     return false;
   }
-  SetStretchBltMode(gCapture.memory, COLORONCOLOR);
-  const BOOL copied = StretchBlt(gCapture.memory, 0, 0, width, height, screen,
-                                 source.left, source.top, sourceW, sourceH, SRCCOPY);
+  BOOL copied = FALSE;
+  if (width == sourceW && height == sourceH) {
+    copied = BitBlt(gCapture.memory, 0, 0, width, height, screen,
+                    source.left, source.top, SRCCOPY);
+  } else {
+    SetStretchBltMode(gCapture.memory, COLORONCOLOR);
+    copied = StretchBlt(gCapture.memory, 0, 0, width, height, screen,
+                        source.left, source.top, sourceW, sourceH, SRCCOPY);
+  }
   LARGE_INTEGER capturedAt{};
   QueryPerformanceCounter(&capturedAt);
   ReleaseDC(nullptr, screen);

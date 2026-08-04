@@ -1,4 +1,4 @@
-#ifndef UNICODE
+﻿#ifndef UNICODE
 #define UNICODE
 #endif
 #ifndef _UNICODE
@@ -207,6 +207,7 @@ namespace {
     }
 
     void WorkerMain() {
+        gta5::app::runtime::ConfigureLatencySensitiveThread();
         PostStatus(T("status.search_game"));
         HideAllGameOverlays();
 
@@ -527,6 +528,7 @@ namespace {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR commandLine, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    gta5::app::runtime::ConfigureLatencySensitiveProcess();
     gta5::app::ui::LoadSettings();
 
     g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\AutoHack3in1SingleInstance");

@@ -15,9 +15,9 @@ void ClearOverlayState();
 void HideTransientOverlays();
 bool DetectInGame();
 void RunSession();
+int CursorSize();
 int TapHoldMs();
 int TapGapMs();
-int CursorSize();
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 }  // namespace gta5::games::slider
