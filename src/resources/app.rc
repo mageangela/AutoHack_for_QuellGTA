@@ -1,6 +1,0 @@
-#include "resource.h"
-
-IDI_APP_ICON ICON "app.ico"
-
-#include "lang/zh-CN.rc"
-#include "lang/en-US.rc"

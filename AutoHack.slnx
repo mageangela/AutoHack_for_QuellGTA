@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="AutoHack/AutoHack.vcxproj" Id="e17b09b4-a01e-4c44-b946-ac95e9032cba" />
+</Solution>

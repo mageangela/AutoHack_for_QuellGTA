@@ -1,0 +1,79 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="games">
+      <UniqueIdentifier>{a6e7d1d3-8295-4117-8ffc-58fbbf523dfd}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="capture">
+      <UniqueIdentifier>{a2cd3977-a1c1-4db3-9f49-d41483054533}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="input">
+      <UniqueIdentifier>{09d90eb7-b513-4220-8b86-a43997df3c43}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="app">
+      <UniqueIdentifier>{7e179978-f583-4470-b8f0-3644f2fe5114}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="capture\game_window.cpp">
+      <Filter>capture</Filter>
+    </ClCompile>
+    <ClCompile Include="input\key_input.cpp">
+      <Filter>input</Filter>
+    </ClCompile>
+    <ClCompile Include="games\choose_fingerprint_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\fingerprint_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\flashing_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\fleeca_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\slider_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\sort_fingerprint_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="app\app_runtime.cpp">
+      <Filter>app</Filter>
+    </ClCompile>
+    <ClCompile Include="app\app_ui.cpp">
+      <Filter>app</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="capture\game_window.h">
+      <Filter>capture</Filter>
+    </ClInclude>
+    <ClInclude Include="input\key_input.h">
+      <Filter>input</Filter>
+    </ClInclude>
+    <ClInclude Include="games\games.h">
+      <Filter>games</Filter>
+    </ClInclude>
+    <ClInclude Include="app\app_runtime.h">
+      <Filter>app</Filter>
+    </ClInclude>
+    <ClInclude Include="app\app_ui.h">
+      <Filter>app</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

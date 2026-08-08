@@ -1,3 +1,4 @@
+#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "games.h"
@@ -40,7 +41,6 @@ struct Frame {
     int x = 0, y = 0, w = 0, h = 0;
     int screenW = 0, screenH = 0;
     double toScreenX = 1.0, toScreenY = 1.0;
-    std::uint64_t windowGeneration = 0;
     std::vector<uint8_t> bgra;
     std::vector<uint8_t> gray;
 };
@@ -56,18 +56,6 @@ struct RoiInfo {
     TitleBars bars;
 };
 
-struct InGameGeometry {
-    bool valid = false;
-    std::uint64_t windowGeneration = 0;
-    int frameW = 0;
-    int frameH = 0;
-    RoiInfo roi;
-    Rect target;
-    std::vector<Rect> components;
-};
-
-static InGameGeometry gDetectedGeometry;
-
 struct BlockInfo {
     int index = 0;
     Rect rect;
@@ -82,8 +70,6 @@ struct OverlayState {
     bool visible = false;
     uint64_t targetHash = 0;
     Rect target;
-    int levelMarker = -1;
-    Rect levelMarkerLine;
     std::vector<BlockInfo> blocks;
 };
 
@@ -94,28 +80,16 @@ struct SolverCache {
     std::vector<BlockInfo> baseBlocks;
 };
 
-enum class AutomationPhase {
-    Idle,
-    Selecting,
-    VerifyDelay,
-    Submitting,
-    WaitingLevel,
-};
-
 struct AutomationState {
-    AutomationPhase phase = AutomationPhase::Idle;
+    bool submitted = false;
     uint64_t plannedHash = 0;
-    int plannedLevelMarker = -1;
-    int observedLevelMarker = -1;
-    int levelChangeFrames = 0;
-    std::chrono::steady_clock::time_point verifyAfter{};
-    std::chrono::steady_clock::time_point submittedAt{};
     gta5::input::Job inputJob;
 };
 
 struct FrameTiming {
     double captureMs = 0.0;
     double gateMs = 0.0;
+    double successMs = 0.0;
     double roiMs = 0.0;
     double hashMs = 0.0;
     double answerMs = 0.0;
@@ -126,6 +100,7 @@ struct FrameTiming {
     double totalMs = 0.0;
     bool cacheHit = false;
     bool minigame = false;
+    bool success = false;
 };
 
 static HWND gMainWnd = nullptr;
@@ -154,11 +129,12 @@ static std::string timingText(const FrameTiming& t) {
     std::snprintf(
         buf,
         sizeof(buf),
-        "dt=%.1fms cap=%.1f ana=%.1f gate=%.1f roi=%.1f hash=%.1f ans=%.1f state=%.1f auto=%.1f pub=%.1f",
+        "dt=%.1fms cap=%.1f ana=%.1f gate=%.1f suc=%.1f roi=%.1f hash=%.1f ans=%.1f state=%.1f auto=%.1f pub=%.1f",
         t.totalMs,
         t.captureMs,
         t.analyzeMs,
         t.gateMs,
+        t.successMs,
         t.roiMs,
         t.hashMs,
         t.answerMs,
@@ -207,9 +183,6 @@ static Rect scaleRectToScreen(const Frame& f, Rect r) {
 
 static OverlayState scaleOverlayStateToScreen(const Frame& f, OverlayState s) {
     s.target = scaleRectToScreen(f, s.target);
-    if (s.levelMarker >= 0) {
-        s.levelMarkerLine = scaleRectToScreen(f, s.levelMarkerLine);
-    }
     for (auto& b : s.blocks) {
         b.rect = scaleRectToScreen(f, b.rect);
     }
@@ -413,7 +386,6 @@ static bool captureScreen(Frame& out) {
     out.screenW = captured.screenW; out.screenH = captured.screenH;
     out.toScreenX = captured.toScreenX;
     out.toScreenY = captured.toScreenY;
-    out.windowGeneration = captured.windowGeneration;
     const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
     out.bgra.assign(px, px + static_cast<size_t>(out.w) * out.h * 4);
     out.gray.resize(static_cast<size_t>(out.w) * out.h);
@@ -567,21 +539,15 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
 
         for (const auto& components : bars) {
             if (&components == &target) continue;
-            const double componentWidthRatio = components.rect.w / (double)target.rect.w;
-            if (!(target.cx - components.cx > target.rect.w * 0.70 &&
-                  componentWidthRatio > 0.45 && componentWidthRatio < 1.05)) continue;
+            if (!(components.cx < target.cx - scaledPx(f, 384) &&
+                  components.rect.w > scaledPx(f, 307) && components.rect.w < scaledPx(f, 730))) continue;
             if (!(components.cy > target.cy + f.h * 0.07 && components.cy < target.cy + f.h * 0.23)) continue;
 
             for (const auto& signals : bars) {
                 if (&signals == &target || &signals == &components) continue;
                 if (!(signals.cy > components.cy + f.h * 0.35 && signals.cy < f.h * 0.84)) continue;
-                const double pairedWidth = (target.rect.w + signals.rect.w) * 0.5;
-                if (!closeEnough(signals.cx, target.cx, pairedWidth * 0.12)) continue;
-                if (!closeEnough(signals.rect.w, target.rect.w, pairedWidth * 0.15)) continue;
-                if (!closeEnough(signals.rect.x, target.rect.x, pairedWidth * 0.12)) continue;
-                if (!closeEnough(right(signals.rect), right(target.rect), pairedWidth * 0.12)) continue;
-                const double rightPaneLeft = std::min(target.rect.x, signals.rect.x);
-                if (right(components.rect) > rightPaneLeft + pairedWidth * 0.03) continue;
+                if (!closeEnough(signals.cx, target.cx, scaledPx(f, 230))) continue;
+                if (!closeEnough(signals.rect.w, target.rect.w, scaledPx(f, 307))) continue;
 
                 int left = components.rect.x - scaledPx(f, 36);
                 int top = target.rect.y - scaledPx(f, 14);
@@ -635,31 +601,6 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
         *diag = buf;
     }
     return info;
-}
-
-static bool validateMinigameGeometry(const Frame& f, const InGameGeometry& geometry) {
-    if (!geometry.valid || geometry.windowGeneration != f.windowGeneration ||
-        geometry.frameW != f.w || geometry.frameH != f.h) return false;
-
-    auto hasWhiteUi = [&](Rect rect) {
-        rect = clampRect(rect, f.w, f.h);
-        if (rect.w <= 0 || rect.h <= 0) return false;
-        const int step = std::max(1, std::min(rect.w, rect.h) / 12);
-        int white = 0;
-        int samples = 0;
-        for (int y = rect.y; y < rect.y + rect.h; y += step) {
-            for (int x = rect.x; x < rect.x + rect.w; x += step) {
-                const size_t pixel = (static_cast<size_t>(y) * f.w + x) * 4;
-                white += isFlashingStyleWhite(f.bgra[pixel + 2], f.bgra[pixel + 1], f.bgra[pixel]) ? 1 : 0;
-                ++samples;
-            }
-        }
-        return samples > 0 && white * 100 >= samples * 2;
-    };
-
-    return hasWhiteUi(geometry.roi.bars.target) &&
-           hasWhiteUi(geometry.roi.bars.components) &&
-           hasWhiteUi(geometry.roi.bars.signals);
 }
 
 static std::vector<int> edgeLinePeaks(const std::vector<int>& projection, int base, int minDist, double thresholdRatio) {
@@ -869,81 +810,40 @@ static bool detectRois(const Frame& f, const RoiInfo& roi, Rect& target, std::ve
     return true;
 }
 
-static int detectLevelMarker(const Frame& f, Rect signalsBar, std::string* diag = nullptr,
-                             Rect* markerLine = nullptr) {
-    if (markerLine) *markerLine = {};
-    signalsBar = clampRect(signalsBar, f.w, f.h);
-    if (signalsBar.w <= 0 || signalsBar.h <= 0 || f.bgra.size() != (size_t)f.w * f.h * 4) {
-        if (diag) *diag = "level marker unavailable";
-        return -1;
+static bool isSuccessPanelVisible(const Frame& f, const RoiInfo& roi, std::string* diag = nullptr) {
+    if (roi.panel.w <= 0 || roi.panel.h <= 0) {
+        if (diag) *diag = "success check skipped: no panel";
+        return false;
     }
 
-    const int yStart = std::min(f.h, signalsBar.y + signalsBar.h);
-    const int yEnd = std::min(f.h, signalsBar.y + signalsBar.h * 2);
-    const int minRun = std::max(scaledPx(f, 42), (int)std::lround(signalsBar.w * 0.12));
-    const int maxRun = std::max(minRun + 1, (int)std::lround(signalsBar.w * 0.27));
-    const int maxGap = scaledPx(f, 3);
-    int bestLeft = -1, bestRight = -1, bestY = -1;
+    // Same idea as GTAscript2: sample the expected SIGNAL MATCH popup area and
+    // classify it by white UI pixels. This tool anchors that area from the
+    // detected main panel because the popup spans both left and right panes.
+    Rect p = roi.panel;
+    int left = p.x + (int)(p.w * 0.27);
+    int top = p.y + (int)(p.h * 0.40);
+    int right = p.x + (int)(p.w * 0.75);
+    int bottom = p.y + (int)(p.h * 0.60);
+    Rect r = clampRect({left, top, right - left, bottom - top}, f.w, f.h);
 
-    auto linePixel = [&](int x, int y) {
-        const size_t p = (static_cast<size_t>(y) * f.w + x) * 4;
-        const int blue = f.bgra[p];
-        const int green = f.bgra[p + 1];
-        const int red = f.bgra[p + 2];
-        const int luma = (77 * red + 150 * green + 29 * blue) >> 8;
-        const int high = std::max({red, green, blue});
-        const int low = std::min({red, green, blue});
-        return luma >= 135 && high - low <= 120;
-    };
-
-    for (int y = yStart; y < yEnd; ++y) {
-        int runStart = -1, lastOn = -1;
-        for (int x = signalsBar.x; x <= signalsBar.x + signalsBar.w; ++x) {
-            const bool on = x < signalsBar.x + signalsBar.w && linePixel(x, y);
-            if (on) {
-                if (runStart < 0) runStart = x;
-                lastOn = x;
-            }
-            const bool gapEnded = runStart >= 0 && (!on && x - lastOn > maxGap);
-            const bool rowEnded = x == signalsBar.x + signalsBar.w;
-            if (!gapEnded && !rowEnded) continue;
-
-            const int runWidth = lastOn - runStart + 1;
-            if (runWidth >= minRun && runWidth <= maxRun &&
-                runWidth > bestRight - bestLeft + 1) {
-                bestLeft = runStart;
-                bestRight = lastOn;
-                bestY = y;
-            }
-            runStart = -1;
-            lastOn = -1;
+    int white = 0;
+    int samples = 0;
+    int step = std::max(1, (int)std::lround(roi.panel.w / 314.0));
+    for (int y = r.y; y < r.y + r.h; y += step) {
+        for (int x = r.x; x < r.x + r.w; x += step) {
+            const size_t pixel = (static_cast<size_t>(y) * f.w + x) * 4;
+            if (isFlashingStyleWhite(f.bgra[pixel + 2], f.bgra[pixel + 1], f.bgra[pixel])) ++white;
+            ++samples;
         }
     }
 
-    if (bestLeft < 0) {
-        if (diag) *diag = "level marker line not found";
-        return -1;
-    }
-
-    const double center = (bestLeft + bestRight) * 0.5;
-    const double firstCenter = signalsBar.x + signalsBar.w * 0.20;
-    const double spacing = signalsBar.w * 0.195;
-    const int marker = (int)std::lround((center - firstCenter) / spacing);
-    if (marker < 0 || marker >= 4) {
-        if (diag) *diag = "level marker outside slots";
-        return -1;
-    }
-
+    int pct = samples > 0 ? white * 100 / samples : 0;
     if (diag) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "level marker=%d line=(%d..%d y=%d)",
-                      marker + 1, bestLeft, bestRight, bestY);
+        std::snprintf(buf, sizeof(buf), "success pct=%d rect=%s step=%d", pct, rectText(r).c_str(), step);
         *diag = buf;
     }
-    if (markerLine) {
-        *markerLine = {bestLeft, bestY, bestRight - bestLeft + 1, 1};
-    }
-    return marker;
+    return pct >= 4;
 }
 
 struct GrayPatch {
@@ -976,29 +876,16 @@ static GrayPatch downsampleGray(const Frame& f, Rect r, int divisor) {
     return out;
 }
 
-static GrayPatch resizeGrayBilinear(const GrayPatch& src, int w, int h) {
+static GrayPatch resizeGrayNearest(const GrayPatch& src, int w, int h) {
     GrayPatch out;
     out.w = std::max(1, w);
     out.h = std::max(1, h);
     out.pixels.resize(static_cast<size_t>(out.w) * out.h);
     for (int y = 0; y < out.h; ++y) {
-        const double sourceY = std::clamp((y + 0.5) * src.h / out.h - 0.5,
-                                          0.0, (double)(src.h - 1));
-        const int y0 = (int)std::floor(sourceY);
-        const int y1 = std::min(src.h - 1, y0 + 1);
-        const double fy = sourceY - y0;
+        const int sy = std::min(src.h - 1, (int)((int64_t)y * src.h / out.h));
         for (int x = 0; x < out.w; ++x) {
-            const double sourceX = std::clamp((x + 0.5) * src.w / out.w - 0.5,
-                                              0.0, (double)(src.w - 1));
-            const int x0 = (int)std::floor(sourceX);
-            const int x1 = std::min(src.w - 1, x0 + 1);
-            const double fx = sourceX - x0;
-            const double top = src.pixels[y0 * src.w + x0] * (1.0 - fx)
-                + src.pixels[y0 * src.w + x1] * fx;
-            const double bottom = src.pixels[y1 * src.w + x0] * (1.0 - fx)
-                + src.pixels[y1 * src.w + x1] * fx;
-            out.pixels[y * out.w + x] = (uint8_t)std::clamp(
-                (int)std::lround(top * (1.0 - fy) + bottom * fy), 0, 255);
+            const int sx = std::min(src.w - 1, (int)((int64_t)x * src.w / out.w));
+            out.pixels[y * out.w + x] = src.pixels[sy * src.w + sx];
         }
     }
     return out;
@@ -1008,7 +895,10 @@ static double matchGrayZncc(const GrayPatch& target, const GrayPatch& component)
     constexpr double kInvalidScore = -2.0;
     if (component.w >= target.w || component.h >= target.h) return kInvalidScore;
 
-    constexpr int sampleStep = 1;
+    // Sampling every other template pixel cuts correlation work by about 4x.
+    // The downsampled ridges remain several pixels wide, so this does not lose
+    // the fingerprint structure visible in the source image.
+    constexpr int sampleStep = 2;
     int64_t componentSum = 0, componentSquared = 0;
     int samples = 0;
     for (int y = 0; y < component.h; y += sampleStep) {
@@ -1077,7 +967,7 @@ static std::vector<double> answerScores(const Frame& f, Rect target, const std::
         for (const auto& component : componentPatches) {
             const int sw = std::max(2, (int)std::lround(component.w * scale));
             const int sh = std::max(2, (int)std::lround(component.h * scale));
-            const GrayPatch scaled = resizeGrayBilinear(component, sw, sh);
+            const GrayPatch scaled = resizeGrayNearest(component, sw, sh);
             scaleScores.push_back(matchGrayZncc(targetPatch, scaled));
         }
 
@@ -1279,54 +1169,37 @@ static void appendCursorMoves(int& cur, int target, std::vector<gta5::input::Key
     cur = target;
 }
 
-static void planAndRunAutomation(const OverlayState& state, AutomationState& aut,
-                                 std::string* diag = nullptr, int levelMarker = -1) {
+static void planAndRunAutomation(const OverlayState& state, AutomationState& aut, std::string* diag = nullptr) {
     if (!state.visible) {
         resetAutomation(aut);
         if (diag) *diag = "auto reset";
         return;
     }
 
-    if (aut.plannedHash != 0 && !sameTargetFingerprint(aut.plannedHash, state.targetHash)) {
-        resetAutomation(aut);
-    }
-
-    if (aut.phase == AutomationPhase::Selecting && aut.inputJob) {
+    if (aut.inputJob) {
         if (aut.inputJob.Pending()) {
-            if (diag) *diag = "selection input queued";
+            if (diag) *diag = "auto input queued";
             return;
         }
         if (!aut.inputJob.Succeeded()) {
-            resetAutomation(aut);
-            if (diag) *diag = "selection input canceled or failed";
+            aut = {};
+            if (diag) *diag = "auto input canceled or failed";
             return;
         }
         aut.inputJob = {};
-        aut.phase = AutomationPhase::VerifyDelay;
-        aut.verifyAfter = Clock::now() + std::chrono::milliseconds(120);
-        if (diag) *diag = "selection input executed; waiting to verify";
+        aut.submitted = true;
+        if (diag) *diag = "auto plan executed";
         return;
     }
 
-    if (aut.phase == AutomationPhase::VerifyDelay && Clock::now() < aut.verifyAfter) {
-        if (diag) *diag = "waiting to verify selection";
-        return;
-    }
-    if (aut.phase == AutomationPhase::Submitting ||
-        aut.phase == AutomationPhase::WaitingLevel) {
-        return;
-    }
-
-    if (allBlocksCorrectlySelected(state)) {
-        std::vector<gta5::input::Command> commands{
-            {{0x0F, false}, gta5::input::Action::LongPress},
-        };
-        aut.inputJob = gta5::input::QueueSequence(commands);
-        aut.phase = AutomationPhase::Submitting;
-        aut.plannedHash = state.targetHash;
-        aut.plannedLevelMarker = levelMarker;
-        if (diag) *diag = "selection verified; tab queued";
-        return;
+    if (aut.submitted) {
+        if (!sameTargetFingerprint(aut.plannedHash, state.targetHash)) {
+            aut.submitted = false;
+            aut.plannedHash = 0;
+        } else {
+            aut.submitted = false;
+            if (diag) *diag = "auto retry after submit without success";
+        }
     }
 
     int cur = cursorIndex(state);
@@ -1355,57 +1228,58 @@ static void planAndRunAutomation(const OverlayState& state, AutomationState& aut
     }
 
     std::vector<gta5::input::Command> commands;
-    commands.reserve(keys.size());
+    commands.reserve(keys.size() + 1);
     for (const auto& key : keys) commands.push_back({key, gta5::input::Action::Tap});
+    commands.push_back({{0x0F, false}, gta5::input::Action::LongPress});
     aut.inputJob = gta5::input::QueueSequence(commands);
-    aut.phase = AutomationPhase::Selecting;
     aut.plannedHash = state.targetHash;
-    aut.plannedLevelMarker = levelMarker;
 
     if (diag) {
-        *diag = "selection plan queued toggles=" + std::to_string(toggles);
+        *diag = "auto plan queued toggles=" + std::to_string(toggles) + " tab=2s";
     }
 }
 
-static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string* diag = nullptr,
-                                 FrameTiming* timing = nullptr, InGameGeometry* geometry = nullptr) {
+static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string* diag = nullptr, FrameTiming* timing = nullptr) {
     auto analyzeStart = Clock::now();
     OverlayState os;
     std::string minigameDiag;
     auto phaseStart = Clock::now();
-    const bool geometryHit = geometry && validateMinigameGeometry(f, *geometry);
-    RoiInfo roi = geometryHit ? geometry->roi : detectMinigame(f, &minigameDiag);
+    RoiInfo roi = detectMinigame(f, &minigameDiag);
     if (timing) {
         timing->gateMs = msSince(phaseStart);
         timing->minigame = roi.isMinigame;
     }
     if (!roi.isMinigame) {
-        if (geometry) *geometry = {};
         if (diag) *diag = "not in minigame: " + minigameDiag;
         if (timing) timing->analyzeMs = msSince(analyzeStart);
         return os;
     }
 
-    Rect target = geometryHit ? geometry->target : Rect{};
-    std::vector<Rect> comps = geometryHit ? geometry->components : std::vector<Rect>{};
+    std::string successDiag;
+    phaseStart = Clock::now();
+    if (isSuccessPanelVisible(f, roi, &successDiag)) {
+        cache = {};
+        if (diag) *diag = "success panel visible: " + successDiag;
+        if (timing) {
+            timing->successMs = msSince(phaseStart);
+            timing->success = true;
+            timing->analyzeMs = msSince(analyzeStart);
+        }
+        return os;
+    }
+    if (timing) timing->successMs = msSince(phaseStart);
+
+    Rect target;
+    std::vector<Rect> comps;
     std::string roiDiag;
     phaseStart = Clock::now();
-    if (!geometryHit && !detectRois(f, roi, target, comps, &roiDiag)) {
+    if (!detectRois(f, roi, target, comps, &roiDiag)) {
         if (diag) *diag = "minigame found, ROI failed: " + roiDiag;
         if (timing) {
             timing->roiMs = msSince(phaseStart);
             timing->analyzeMs = msSince(analyzeStart);
         }
         return os;
-    }
-    if (geometry && !geometryHit) {
-        geometry->valid = true;
-        geometry->windowGeneration = f.windowGeneration;
-        geometry->frameW = f.w;
-        geometry->frameH = f.h;
-        geometry->roi = roi;
-        geometry->target = target;
-        geometry->components = comps;
     }
     if (timing) timing->roiMs = msSince(phaseStart);
 
@@ -1455,7 +1329,6 @@ static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string
     os.targetHash = targetHash;
     os.target = target;
     os.blocks = cache.baseBlocks;
-    os.levelMarker = detectLevelMarker(f, roi.bars.signals, nullptr, &os.levelMarkerLine);
     phaseStart = Clock::now();
     markStates(f, os.blocks);
     if (timing) timing->stateMs = msSince(phaseStart);
@@ -1566,6 +1439,15 @@ static int runCli(int argc, wchar_t** argv) {
         return 2;
     }
 
+    std::string successDiag;
+    bool successVisible = isSuccessPanelVisible(f, roi, &successDiag);
+    printf("success: %s\n", successVisible ? "true" : "false");
+    printf("success_diag: %s\n", successDiag.c_str());
+    if (successVisible) {
+        Gdiplus::GdiplusShutdown(gdiplusToken);
+        return 0;
+    }
+
     Rect target;
     std::vector<Rect> comps;
     std::string roiDiag;
@@ -1576,11 +1458,6 @@ static int runCli(int argc, wchar_t** argv) {
         Gdiplus::GdiplusShutdown(gdiplusToken);
         return 3;
     }
-
-    std::string markerDiag;
-    const int levelMarker = detectLevelMarker(f, roi.bars.signals, &markerDiag);
-    printf("level_marker: %d\n", levelMarker >= 0 ? levelMarker + 1 : -1);
-    printf("level_marker_diag: %s\n", markerDiag.c_str());
 
     auto scores = answerScores(f, target, comps);
     std::vector<int> order(scores.size());
@@ -1635,6 +1512,7 @@ static void workerLoop() {
     postLog("worker started");
     int frameNo = 0;
     bool lastMinigame = false;
+    bool lastSuccess = false;
     bool captureFailed = false;
     SolverCache cache;
     AutomationState automation;
@@ -1668,6 +1546,10 @@ static void workerLoop() {
                 postLog("minigame lost");
             }
 
+            if (timing.success && !lastSuccess) {
+                postLog("success panel detected");
+            }
+
             if (state.visible && !timing.cacheHit) {
                 postLog("answer ready: correct=" + correctList(state)
                     + " target=" + rectText(state.target)
@@ -1678,6 +1560,7 @@ static void workerLoop() {
                 postLog(autoDiag);
             }
             lastMinigame = timing.minigame;
+            lastSuccess = timing.success;
         } else {
             if (!captureFailed) {
                 postLog("screen capture failed");
@@ -1704,7 +1587,6 @@ static void drawOverlay(HDC hdc) {
     DeleteObject(clearBrush);
 
     if (!s.visible) return;
-    const int savedDc = SaveDC(hdc);
     int refBlock = s.blocks.empty() ? std::max(1, s.target.w / 3) : std::max(1, s.blocks.front().rect.w);
     int blockPen = std::max(1, (int)std::lround(refBlock / 60.0));
     int targetPen = blockPen;
@@ -1713,11 +1595,9 @@ static void drawOverlay(HDC hdc) {
     HPEN green = CreatePen(PS_SOLID, blockPen, RGB(0, 255, 0));
     HPEN red = CreatePen(PS_SOLID, blockPen, RGB(255, 50, 50));
     HPEN magenta = CreatePen(PS_SOLID, targetPen, RGB(255, 0, 255));
-    HPEN markerPen = CreatePen(PS_SOLID, blockPen, RGB(0, 255, 0));
     HBRUSH hollow = (HBRUSH)GetStockObject(HOLLOW_BRUSH);
     HBRUSH yellow = CreateSolidBrush(RGB(255, 230, 0));
     HBRUSH pink = CreateSolidBrush(RGB(255, 70, 190));
-    HBRUSH markerFill = CreateSolidBrush(RGB(0, 255, 0));
     SelectObject(hdc, hollow);
     SetBkMode(hdc, TRANSPARENT);
 
@@ -1758,26 +1638,7 @@ static void drawOverlay(HDC hdc) {
         }
     }
 
-    if (s.levelMarker >= 0 && s.levelMarkerLine.w > 0) {
-        const int centerX = s.levelMarkerLine.x + s.levelMarkerLine.w / 2 - gVirtualX;
-        const int markerWidth = std::max(10, (int)std::lround(s.levelMarkerLine.w * 0.16));
-        const int markerHeight = std::max(7, (int)std::lround(markerWidth * 0.65));
-        const int markerTop = s.levelMarkerLine.y + s.levelMarkerLine.h - gVirtualY
-            + std::max(4, (int)std::lround(markerHeight * 0.75));
-        POINT triangle[3]{
-            {centerX - markerWidth / 2, markerTop},
-            {centerX + markerWidth / 2, markerTop},
-            {centerX, markerTop + markerHeight},
-        };
-        SelectObject(hdc, markerPen);
-        SelectObject(hdc, markerFill);
-        Polygon(hdc, triangle, 3);
-        SelectObject(hdc, hollow);
-    }
-
-    if (savedDc) RestoreDC(hdc, savedDc);
-    DeleteObject(green); DeleteObject(red); DeleteObject(magenta); DeleteObject(markerPen);
-    DeleteObject(yellow); DeleteObject(pink); DeleteObject(markerFill);
+    DeleteObject(green); DeleteObject(red); DeleteObject(magenta); DeleteObject(yellow); DeleteObject(pink);
 }
 
 static LRESULT CALLBACK overlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1883,30 +1744,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 
-bool DetectInGame() {
-  Frame f;
-  if (!captureScreen(f)) {
-    gDetectedGeometry = {};
-    return false;
-  }
-  std::string diag;
-  RoiInfo roi = detectMinigame(f, &diag);
-  Rect target;
-  std::vector<Rect> components;
-  if (!roi.isMinigame || !detectRois(f, roi, target, components, &diag)) {
-    gDetectedGeometry = {};
-    return false;
-  }
-  gDetectedGeometry.valid = true;
-  gDetectedGeometry.windowGeneration = f.windowGeneration;
-  gDetectedGeometry.frameW = f.w;
-  gDetectedGeometry.frameH = f.h;
-  gDetectedGeometry.roi = roi;
-  gDetectedGeometry.target = target;
-  gDetectedGeometry.components = std::move(components);
-  return true;
-}
-void ResetInGameCache() { gDetectedGeometry = {}; }
+bool DetectInGame() { Frame f; if (!captureScreen(f)) return false; std::string diag; return detectMinigame(f, &diag).isMinigame; }
 HWND OverlayWindow() { return gOverlayWnd; }
 void SetOverlayWindow(HWND hwnd) { gOverlayWnd = hwnd; }
 void SetUiThread() { gUiThreadId = GetCurrentThreadId(); }
@@ -1951,13 +1789,11 @@ bool RunSession(const std::function<bool()>& stopRequested,
     }
   };
   SolverCache cache;
-  InGameGeometry geometry = gDetectedGeometry;
   AutomationState automation;
   gRunning.store(true);
   RECT game{};
   if (!gta5::capture::GetGameClientRect(game)) {
     gRunning.store(false);
-    ResetInGameCache();
     return false;
   }
   gVirtualX = game.left; gVirtualY = game.top;
@@ -1970,103 +1806,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
   while (!stopRequested()) {
     syncOverlay();
     Frame frame; FrameTiming timing;
-    if (!captureScreen(frame)) {
-      geometry = {};
-      cache = {};
-      ResetInGameCache();
-      Sleep(30);
-      continue;
-    }
-    if (geometry.valid && geometry.windowGeneration != frame.windowGeneration) {
-      geometry = {};
-      cache = {};
-      ResetInGameCache();
-    }
-    const bool waitingForLevel =
-        automation.phase == AutomationPhase::Submitting ||
-        automation.phase == AutomationPhase::WaitingLevel;
-    if (waitingForLevel && automation.plannedLevelMarker >= 0) {
-      int levelMarker = -1;
-      if (!validateMinigameGeometry(frame, geometry)) {
-        RoiInfo relocatedRoi = detectMinigame(frame);
-        Rect relocatedTarget;
-        std::vector<Rect> relocatedComponents;
-        if (relocatedRoi.isMinigame &&
-            detectRois(frame, relocatedRoi, relocatedTarget, relocatedComponents)) {
-          InGameGeometry relocated;
-          relocated.valid = true;
-          relocated.windowGeneration = frame.windowGeneration;
-          relocated.frameW = frame.w;
-          relocated.frameH = frame.h;
-          relocated.roi = relocatedRoi;
-          relocated.target = relocatedTarget;
-          relocated.components = std::move(relocatedComponents);
-          geometry = std::move(relocated);
-          cache = {};
-        } else {
-          geometry = {};
-          cache = {};
-        }
-      }
-      if (geometry.valid) {
-        levelMarker = detectLevelMarker(frame, geometry.roi.bars.signals);
-      }
-
-      if (levelMarker >= 0 && levelMarker != automation.plannedLevelMarker) {
-        if (automation.observedLevelMarker == levelMarker) {
-          ++automation.levelChangeFrames;
-        } else {
-          automation.observedLevelMarker = levelMarker;
-          automation.levelChangeFrames = 1;
-        }
-      } else {
-        automation.observedLevelMarker = -1;
-        automation.levelChangeFrames = 0;
-      }
-
-      if (automation.levelChangeFrames >= 2) {
-        completedAnyLevel = true;
-        setStatus(L"fingerprint: level complete");
-        resetAutomation(automation);
-        cache = {};
-        invalidFrames = 0;
-        retainedUsable = false;
-        publishState({});
-        Sleep(120);
-        continue;
-      }
-
-      if (automation.phase == AutomationPhase::Submitting && automation.inputJob) {
-        if (automation.inputJob.Pending()) {
-          setStatus(L"fingerprint: waiting next level");
-          Sleep(kFrameDelayMs);
-          continue;
-        }
-        if (!automation.inputJob.Succeeded()) {
-          resetAutomation(automation);
-          cache = {};
-          setStatus(L"fingerprint: locating");
-          continue;
-        }
-        automation.inputJob = {};
-        automation.phase = AutomationPhase::WaitingLevel;
-        automation.submittedAt = Clock::now();
-      }
-
-      if (automation.phase == AutomationPhase::WaitingLevel &&
-          Clock::now() - automation.submittedAt >= std::chrono::milliseconds(3000)) {
-        resetAutomation(automation);
-        cache = {};
-        setStatus(L"fingerprint: locating");
-        continue;
-      }
-
-      setStatus(L"fingerprint: waiting next level");
-      Sleep(kFrameDelayMs);
-      continue;
-    }
-
-    OverlayState state = analyzeFrame(frame, cache, nullptr, &timing, &geometry);
+    if (!captureScreen(frame)) { Sleep(30); continue; }
+    OverlayState state = analyzeFrame(frame, cache, nullptr, &timing);
     if (!timing.minigame) {
       ++invalidFrames;
       if (++lostFrames >= 15) {
@@ -2083,6 +1824,17 @@ bool RunSession(const std::function<bool()>& stopRequested,
       continue;
     }
     lostFrames = 0;
+    if (timing.success) {
+      completedAnyLevel = true;
+      setStatus(L"fingerprint: level complete");
+      resetAutomation(automation);
+      cache = {};
+      invalidFrames = 0;
+      retainedUsable = false;
+      publishState({});
+      Sleep(120);
+      continue;
+    }
     if (!state.visible) {
       ++invalidFrames;
       if (invalidFrames == kAutomationMissToleranceFrames) resetAutomation(automation);
@@ -2100,16 +1852,16 @@ bool RunSession(const std::function<bool()>& stopRequested,
     if (overlayEnabled()) publishState(retainedState);
     std::string autoDiag;
     setStatus(state.visible ? L"fingerprint: auto input" : L"fingerprint: locating");
-    const int levelMarker = state.levelMarker;
-    if (levelMarker >= 0) {
-      planAndRunAutomation(state, automation, &autoDiag, levelMarker);
+    planAndRunAutomation(state, automation, &autoDiag);
+    if (automation.submitted) {
+      completedAnyLevel = true;
+      setStatus(L"fingerprint: waiting next level");
     }
     Sleep(kFrameDelayMs);
   }
   gRunning.store(false);
   resetAutomation(automation);
   ClearOverlay();
-  ResetInGameCache();
   return completedAnyLevel;
 }
 

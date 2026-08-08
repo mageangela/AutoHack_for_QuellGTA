@@ -1,4 +1,5 @@
-﻿#include "games.h"
+﻿#define NOMINMAX
+#include "games.h"
 #include "../capture/game_window.h"
 #include "../input/key_input.h"
 
@@ -27,19 +28,11 @@ struct Image {
     int width = 0, height = 0;
     int screen_x = 0, screen_y = 0;
     double to_screen_x = 1.0, to_screen_y = 1.0;
-    std::uint64_t window_generation = 0;
     std::vector<uint8_t> bgra;
     const uint8_t* pixel(int x, int y) const { return &bgra[(y * width + x) * 4]; }
 };
 struct FrameTiming { LONGLONG last_present_qpc = 0; UINT accumulated_frames = 0; };
 struct Connectors { Point first, second; Box first_box, second_box; };
-struct InGameGeometry {
-    bool valid = false;
-    std::uint64_t window_generation = 0;
-    int width = 0, height = 0;
-    Connectors connectors{};
-};
-InGameGeometry g_detected_geometry;
 struct Map {
     int x1, y1, x2, y2, width, height, grid;
     std::vector<uint8_t> blocked;
@@ -148,7 +141,6 @@ bool capture_client(Image& image, FrameTiming* timing = nullptr) {
     image.screen_y = frame.screenY;
     image.to_screen_x = frame.toScreenX;
     image.to_screen_y = frame.toScreenY;
-    image.window_generation = frame.windowGeneration;
     image.bgra.resize(frame.bgra.size() * sizeof(std::uint32_t));
     std::memcpy(image.bgra.data(), frame.bgra.data(), image.bgra.size());
     if (timing) {
@@ -269,15 +261,6 @@ std::optional<Connectors> find_connectors(const Image& image) {
         if (score > best_score) { best_score = score; best = {{first, second, boxes[a], boxes[b]}}; }
     }
     return best;
-}
-
-bool validate_connectors(const Image& image, const Connectors& connectors) {
-    auto valid_box = [&](const Box& box) {
-        return box.x >= 0 && box.y >= 0 && box.w > 0 && box.h > 0 &&
-               box.x + box.w <= image.width && box.y + box.h <= image.height &&
-               is_connector_candidate(image, box);
-    };
-    return valid_box(connectors.first_box) && valid_box(connectors.second_box);
 }
 
 bool is_wall(const uint8_t* p) {
@@ -731,13 +714,12 @@ void wait_precisely(double seconds) {
 }
 
 constexpr int SESSION_INGAME_LOST = 2;
-constexpr int SESSION_GEOMETRY_CHANGED = 3;
 constexpr int INGAME_LOST_CONSECUTIVE_FRAMES = 3;
 constexpr DWORD RESULT_SCREEN_TIMEOUT_MS = 2000;
 constexpr DWORD RESULT_ENTER_DELAY_MS = 2000;
 constexpr DWORD NEXT_ROUND_TIMEOUT_MS = 2000;
 
-int run_ingame_session(Image& frame, Connectors& connectors, std::uint64_t& geometry_generation) {
+int run_ingame_session(Image& frame, const Connectors& connectors) {
     update_speed_display(0);
     struct SessionSpeedReset {
         ~SessionSpeedReset() { update_speed_display(0); }
@@ -765,7 +747,6 @@ int run_ingame_session(Image& frame, Connectors& connectors, std::uint64_t& geom
         FrameTiming captured_timing{};
         const bool captured = capture_client(frame, &captured_timing);
         if (!captured) {
-            g_detected_geometry = {};
             set_status(L"fleeca: capture failed");
             append_log(L"GTA5_Enhanced.exe window capture was lost.");
             return 1;
@@ -788,22 +769,9 @@ int run_ingame_session(Image& frame, Connectors& connectors, std::uint64_t& geom
         if (captured_timing.last_present_qpc > 0)
             previous_present_qpc = captured_timing.last_present_qpc;
         frame_timing = captured_timing;
-        if (frame.window_generation == geometry_generation && validate_connectors(frame, connectors)) {
+        if (find_connectors(frame)) {
             missing_ingame_frames = 0;
             return 0;
-        }
-        const auto relocated = find_connectors(frame);
-        if (relocated) {
-            const bool geometry_changed = frame.window_generation != geometry_generation ||
-                relocated->first_box.x != connectors.first_box.x ||
-                relocated->first_box.y != connectors.first_box.y ||
-                relocated->second_box.x != connectors.second_box.x ||
-                relocated->second_box.y != connectors.second_box.y;
-            connectors = *relocated;
-            g_detected_geometry = {};
-            geometry_generation = frame.window_generation;
-            missing_ingame_frames = 0;
-            return geometry_changed ? SESSION_GEOMETRY_CHANGED : 0;
         }
         ++missing_ingame_frames;
         return missing_ingame_frames >= INGAME_LOST_CONSECUTIVE_FRAMES
@@ -1010,29 +978,14 @@ int run_live() {
         append_log(L"Could not find or capture the GTA5_Enhanced.exe window.");
         return 1;
     }
-    std::optional<Connectors> connectors;
-    std::uint64_t geometry_generation = 0;
-    if (g_detected_geometry.valid &&
-        g_detected_geometry.window_generation == frame.window_generation &&
-        g_detected_geometry.width == frame.width && g_detected_geometry.height == frame.height &&
-        validate_connectors(frame, g_detected_geometry.connectors)) {
-        connectors = g_detected_geometry.connectors;
-        geometry_generation = g_detected_geometry.window_generation;
-    } else {
-        connectors = find_connectors(frame);
-        if (connectors) geometry_generation = frame.window_generation;
-    }
+    std::optional<Connectors> connectors = find_connectors(frame);
     if (!connectors) {
         append_log(L"Minigame not detected in the initial frame.");
         return 1;
     }
 
     while (!stop_requested()) {
-        int session_result = run_ingame_session(frame, *connectors, geometry_generation);
-        if (session_result == SESSION_GEOMETRY_CHANGED) {
-            set_status(L"fleeca: geometry relocated; rebuilding route");
-            continue;
-        }
+        int session_result = run_ingame_session(frame, *connectors);
         if (session_result != SESSION_INGAME_LOST) return session_result;
 
         connectors.reset();
@@ -1071,7 +1024,6 @@ int run_live() {
                 return 1;
             }
             connectors = find_connectors(frame);
-            if (connectors) geometry_generation = frame.window_generation;
         } while (!stop_requested() && !connectors && GetTickCount() < next_round_deadline);
         if (stop_requested()) return 1;
         if (!connectors) {
@@ -1088,24 +1040,8 @@ int run_live() {
 
 bool DetectInGame() {
     Image frame;
-    if (!capture_client(frame)) {
-        g_detected_geometry = {};
-        return false;
-    }
-    const auto connectors = find_connectors(frame);
-    if (!connectors) {
-        g_detected_geometry = {};
-        return false;
-    }
-    g_detected_geometry.valid = true;
-    g_detected_geometry.window_generation = frame.window_generation;
-    g_detected_geometry.width = frame.width;
-    g_detected_geometry.height = frame.height;
-    g_detected_geometry.connectors = *connectors;
-    return true;
+    return capture_client(frame) && find_connectors(frame).has_value();
 }
-
-void ResetInGameCache() { g_detected_geometry = {}; }
 
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status) {
@@ -1116,7 +1052,6 @@ bool RunSession(const std::function<bool()>& stopRequested,
     const int result = run_live();
     g_stop_callback = {};
     g_status = {};
-    ResetInGameCache();
     return result == 0 || g_completed_round;
 }
 

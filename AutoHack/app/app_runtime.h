@@ -12,5 +12,4 @@ void ResetStopRequest();
 std::thread& WorkerThread();
 bool ConfigureLatencySensitiveProcess();
 bool ConfigureLatencySensitiveThread();
-
 }  // namespace gta5::app::runtime
