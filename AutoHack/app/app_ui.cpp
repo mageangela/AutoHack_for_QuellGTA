@@ -1,5 +1,4 @@
-﻿#define NOMINMAX
-#include "app_ui.h"
+﻿#include "app_ui.h"
 
 #include <windowsx.h>
 
@@ -154,21 +153,33 @@ namespace gta5::app::ui {
 
         RECT PanelRect() { return RECT{ 0, 0, CurrentWidth(), CurrentHeight() }; }
 
-        bool ProcessExeNameEquals(DWORD processId, const wchar_t* exeName) {
+        std::wstring FileNameOnly(const wchar_t* path) {
+            if (!path) return L"";
+            const wchar_t* slash = wcsrchr(path, L'\\');
+            const wchar_t* forward = wcsrchr(path, L'/');
+            const wchar_t* base = std::max(slash ? slash + 1 : path, forward ? forward + 1 : path);
+            return base;
+        }
+
+        bool ProcessIsGta(DWORD processId) {
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
             if (!process) return false;
             wchar_t imagePath[MAX_PATH * 4]{};
             DWORD size = static_cast<DWORD>(std::size(imagePath));
-            bool matches = QueryFullProcessImageNameW(process, 0, imagePath, &size) &&
-                wcsstr(imagePath, exeName) != nullptr;
+            bool matches = false;
+            if (QueryFullProcessImageNameW(process, 0, imagePath, &size)) {
+                const std::wstring exeName = FileNameOnly(imagePath);
+                matches = lstrcmpiW(exeName.c_str(), L"GTA5_Enhanced.exe") == 0 ||
+                    lstrcmpiW(exeName.c_str(), L"GTA5.exe") == 0;
+            }
             CloseHandle(process);
             return matches;
         }
 
         struct WindowSearch {
-            const wchar_t* exeName = nullptr;
             HWND window = nullptr;
             RECT rect{};
+            long long area = 0;
         };
 
         BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM parameter) {
@@ -178,20 +189,31 @@ namespace gta5::app::ui {
             if (!GetWindowRect(hwnd, &rect) || rect.right - rect.left < 100 || rect.bottom - rect.top < 100) return TRUE;
             DWORD processId = 0;
             GetWindowThreadProcessId(hwnd, &processId);
-            if (processId && ProcessExeNameEquals(processId, search->exeName)) {
+            const long long area = static_cast<long long>(rect.right - rect.left) * (rect.bottom - rect.top);
+            if (processId && area > search->area && ProcessIsGta(processId)) {
                 search->window = hwnd;
                 search->rect = rect;
-                return FALSE;
+                search->area = area;
             }
             return TRUE;
         }
 
-        bool FindWindowRectByExe(const wchar_t* exeName, RECT& rect) {
-            WindowSearch search{ exeName };
+        bool FindGtaWindowRect(RECT& rect) {
+            WindowSearch search{};
             EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&search));
             if (!search.window) return false;
             rect = search.rect;
             return true;
+        }
+
+        HMONITOR GtaMonitorOrCursorMonitor() {
+            RECT gtaWindow{};
+            if (FindGtaWindowRect(gtaWindow)) {
+                return MonitorFromRect(&gtaWindow, MONITOR_DEFAULTTONEAREST);
+            }
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            return MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
         }
 
         HFONT CreateUiFont(int height, int weight = FW_NORMAL) {
@@ -270,17 +292,7 @@ namespace gta5::app::ui {
     }
 
     RECT InitialHudRect() {
-        RECT anchor{};
-        HMONITOR monitor = nullptr;
-        if (FindWindowRectByExe(L"GTA5_Enhanced.exe", anchor) ||
-            FindWindowRectByExe(L"GTA5.exe", anchor)) {
-            monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
-        }
-        else {
-            POINT cursor{};
-            GetCursorPos(&cursor);
-            monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-        }
+        const HMONITOR monitor = GtaMonitorOrCursorMonitor();
         MONITORINFO info{ sizeof(info) };
         if (!GetMonitorInfoW(monitor, &info)) info.rcMonitor = VirtualDesktopRect();
         const int left = info.rcMonitor.right - CurrentWidth();

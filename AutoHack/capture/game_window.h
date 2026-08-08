@@ -20,6 +20,8 @@ struct GameFrame {
   int width = 0;
   int height = 0;
   int clientHeight = 0;
+  int clientWidth = 0;
+  std::uint64_t windowGeneration = 0;
   LONGLONG captureQpc = 0;
   double toScreenX = 1.0;
   double toScreenY = 1.0;

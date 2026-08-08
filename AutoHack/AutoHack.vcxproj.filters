@@ -37,9 +37,6 @@
     <ClCompile Include="games\choose_fingerprint_module.cpp">
       <Filter>games</Filter>
     </ClCompile>
-    <ClCompile Include="games\fingerprint_module.cpp">
-      <Filter>games</Filter>
-    </ClCompile>
     <ClCompile Include="games\flashing_module.cpp">
       <Filter>games</Filter>
     </ClCompile>
@@ -57,6 +54,12 @@
     </ClCompile>
     <ClCompile Include="app\app_ui.cpp">
       <Filter>app</Filter>
+    </ClCompile>
+    <ClCompile Include="games\find_number_module.cpp">
+      <Filter>games</Filter>
+    </ClCompile>
+    <ClCompile Include="games\match_module.cpp">
+      <Filter>games</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

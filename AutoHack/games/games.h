@@ -14,16 +14,16 @@ HWND MarksWindow();
 void ClearOverlayState();
 void HideTransientOverlays();
 bool DetectInGame();
-void RunSession();
+void ResetInGameCache();
+void RunSession(const std::function<bool()>& stopRequested);
 int CursorSize();
-int TapHoldMs();
-int TapGapMs();
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 }  // namespace gta5::games::slider
 
 namespace gta5::games::flashing {
 bool DetectInGame();
+void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
 void HideOverlay();
@@ -35,6 +35,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::choose_fingerprint {
 bool DetectInGame();
+void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
 void SetUiThread();
@@ -49,6 +50,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::sort_fingerprint {
 bool DetectInGame();
+void ResetInGameCache();
 void SetOverlayWindow(HWND hwnd);
 void ClearOverlay();
 bool RunSession(const std::function<bool()>& stopRequested,
@@ -60,6 +62,25 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::fleeca {
 bool DetectInGame();
+void ResetInGameCache();
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status);
 }  // namespace gta5::games::fleeca
+
+namespace gta5::games::find_number {
+bool DetectInGame();
+void ResetInGameCache();
+bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<void(const std::wstring&)>& status);
+}  // namespace gta5::games::find_number
+
+namespace gta5::games::match {
+bool DetectInGame();
+void ResetInGameCache();
+void SetOverlayWindow(HWND hwnd);
+void ClearOverlay();
+bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<bool()>& overlayEnabled,
+                const std::function<void(const std::wstring&)>& status);
+LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+}  // namespace gta5::games::match

@@ -1,4 +1,3 @@
-#define NOMINMAX
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -31,7 +30,6 @@ static const int GRID_COLS = 6;
 static const int GRID_CELLS = GRID_ROWS * GRID_COLS;
 static const UINT TIMER_ID = 1001;
 static const UINT TIMER_MS = 16;
-static const int kMinigameCheckIntervalFrames = 10;
 static const int kSelectedStableFramesBeforeInput = 2;
 static const int kLevelFocusHideAfterMissFrames = 5;
 struct Pattern {
@@ -67,6 +65,7 @@ struct ScreenShot {
     int screenY = 0;
     double toScreenX = 1.0;
     double toScreenY = 1.0;
+    std::uint64_t windowGeneration = 0;
     std::vector<uint8_t> pixels;
 };
 
@@ -76,6 +75,16 @@ struct WhiteBar {
     int w = 0;
     int h = 0;
     int score = 0;
+};
+
+struct MinigameGeometry {
+    bool valid = false;
+    std::uint64_t windowGeneration = 0;
+    int frameW = 0;
+    int frameH = 0;
+    WhiteBar signal;
+    WhiteBar rightTitle;
+    WhiteBar topTitle;
 };
 
 struct Circle {
@@ -156,6 +165,7 @@ struct AppState {
     int pendingVerifyCol = -1;
     DWORD64 finalSubmitAt = 0;
     bool minigameVisible = false;
+    MinigameGeometry minigameGeometry;
     std::wstring autoMessage = L"Auto idle";
 
     Pattern current{};
@@ -198,6 +208,7 @@ static bool CaptureScreen(ScreenShot& shot) {
     shot.h = captured.height;
     shot.toScreenX = captured.toScreenX;
     shot.toScreenY = captured.toScreenY;
+    shot.windowGeneration = captured.windowGeneration;
     shot.pixels.resize(captured.bgra.size() * sizeof(uint32_t));
     memcpy(shot.pixels.data(), captured.bgra.data(), shot.pixels.size());
     return true;
@@ -390,15 +401,22 @@ static bool DetectCircles(const ScreenShot& shot, int seedRoiX, int seedRoiY, in
     return true;
 }
 
-static bool AutoLocateRoi() {
-    ScreenShot shot;
-    if (!CaptureScreen(shot)) return false;
-
+static bool AutoLocateRoiFromShot(const ScreenShot& shot) {
     const int screenW = shot.w;
     const int screenH = shot.h;
-    std::vector<WhiteBar> bars = FindWhiteBars(shot);
     WhiteBar best{};
-    if (!FindSignalRepeaterBar(shot, bars, best)) {
+    if (g.minigameGeometry.valid &&
+        g.minigameGeometry.windowGeneration == shot.windowGeneration &&
+        g.minigameGeometry.frameW == shot.w && g.minigameGeometry.frameH == shot.h) {
+        best = g.minigameGeometry.signal;
+    } else {
+        std::vector<WhiteBar> bars = FindWhiteBars(shot);
+        if (!FindSignalRepeaterBar(shot, bars, best)) {
+            g.message = L"Auto ROI failed";
+            return false;
+        }
+    }
+    if (best.w <= 0 || best.h <= 0) {
         g.message = L"Auto ROI failed";
         return false;
     }
@@ -479,6 +497,11 @@ static bool AutoLocateRoi() {
     ScaleLockedGeometryToScreen(shot);
     g.message = L"Circles locked";
     return true;
+}
+
+static bool AutoLocateRoi() {
+    ScreenShot shot;
+    return CaptureScreen(shot) && AutoLocateRoiFromShot(shot);
 }
 
 static void SetEditInt(HWND h, int value) {
@@ -568,7 +591,7 @@ static bool FindSignalRepeaterBar(const ScreenShot& shot, const std::vector<Whit
     return bestRank != -1000000;
 }
 
-static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nullptr) {
+static bool AnalyzeMinigamePage(const ScreenShot& shot, MinigameGeometry* geometryOut = nullptr) {
     std::vector<WhiteBar> bars = FindWhiteBars(shot);
     WhiteBar signal{};
     if (!FindSignalRepeaterBar(shot, bars, signal)) return false;
@@ -576,6 +599,8 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
     int titleYSlack = ScalePx(35, shot.h);
     bool hasRightTitle = false;
     int topTitleCount = 0;
+    WhiteBar rightTitle{};
+    WhiteBar topTitle{};
     for (const WhiteBar& b : bars) {
         int centerY = b.y + b.h / 2;
 
@@ -584,6 +609,7 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
             b.w > ScalePx(268, shot.h) &&
             b.score >= 28) {
             hasRightTitle = true;
+            if (b.score > rightTitle.score) rightTitle = b;
         }
 
         if (centerY < signal.y - titleYSlack &&
@@ -592,18 +618,69 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
             b.w > ScalePx(345, shot.h) &&
             b.score >= 28) {
             ++topTitleCount;
+            if (b.score > topTitle.score) topTitle = b;
         }
     }
 
     if (!hasRightTitle || topTitleCount < 1) return false;
-    if (signalOut) *signalOut = signal;
+    if (geometryOut) {
+        geometryOut->valid = true;
+        geometryOut->windowGeneration = shot.windowGeneration;
+        geometryOut->frameW = shot.w;
+        geometryOut->frameH = shot.h;
+        geometryOut->signal = signal;
+        geometryOut->rightTitle = rightTitle;
+        geometryOut->topTitle = topTitle;
+    }
+    return true;
+}
+
+static bool ValidateMinigameGeometry(const ScreenShot& shot, const MinigameGeometry& geometry) {
+    if (!geometry.valid || geometry.windowGeneration != shot.windowGeneration ||
+        geometry.frameW != shot.w || geometry.frameH != shot.h) return false;
+    auto barPresent = [&](const WhiteBar& bar) {
+        const int left = std::clamp(bar.x, 0, shot.w);
+        const int top = std::clamp(bar.y, 0, shot.h);
+        const int right = std::clamp(bar.x + bar.w, 0, shot.w);
+        const int bottom = std::clamp(bar.y + bar.h, 0, shot.h);
+        if (right <= left || bottom <= top) return false;
+        const int step = std::max(1, std::min(right - left, bottom - top) / 10);
+        int white = 0;
+        int samples = 0;
+        for (int y = top; y < bottom; y += step) {
+            for (int x = left; x < right; x += step) {
+                const uint8_t* p = shot.pixels.data() + (static_cast<size_t>(y) * shot.w + x) * 4;
+                white += IsWhiteUiPixel(p[2], p[1], p[0]) ? 1 : 0;
+                ++samples;
+            }
+        }
+        return samples > 0 && white * 100 >= samples * 2;
+    };
+    return barPresent(geometry.signal) && barPresent(geometry.rightTitle) &&
+           barPresent(geometry.topTitle);
+}
+
+static bool CheckMinigamePage(const ScreenShot* shot) {
+    if (!shot) {
+        g.minigameGeometry = {};
+        g.circlesReady = false;
+        return false;
+    }
+    if (ValidateMinigameGeometry(*shot, g.minigameGeometry)) return true;
+    MinigameGeometry relocated;
+    if (!AnalyzeMinigamePage(*shot, &relocated)) {
+        g.minigameGeometry = {};
+        g.circlesReady = false;
+        return false;
+    }
+    g.minigameGeometry = relocated;
+    g.circlesReady = AutoLocateRoiFromShot(*shot);
     return true;
 }
 
 static bool IsMinigamePageVisible() {
     ScreenShot shot;
-    if (!CaptureScreen(shot)) return false;
-    return AnalyzeMinigamePage(shot, nullptr);
+    return CaptureScreen(shot) && CheckMinigamePage(&shot);
 }
 
 static bool FindDecodedDigitsBar(const ScreenShot& shot, const std::vector<WhiteBar>& bars,
@@ -813,9 +890,8 @@ static int DetectLevelSlotFromShot(const ScreenShot& shot, UiRect* focusScreen =
     return std::max(1, std::min(4, slot));
 }
 
-static int DetectLevelSlot() {
-    ScreenShot shot;
-    if (!CaptureScreen(shot)) {
+static int DetectLevelSlotFromCaptured(const ScreenShot* shot) {
+    if (!shot) {
         g.levelFocusDetectedThisFrame = false;
         if (++g.levelFocusMissFrames >= kLevelFocusHideAfterMissFrames) {
             g.levelFocusVisible = false;
@@ -824,7 +900,7 @@ static int DetectLevelSlot() {
     }
 
     UiRect focus{};
-    int slot = DetectLevelSlotFromShot(shot, &focus);
+    int slot = DetectLevelSlotFromShot(*shot, &focus);
     if (slot > 0) {
         g.levelFocus = focus;
         g.levelFocusVisible = true;
@@ -837,6 +913,11 @@ static int DetectLevelSlot() {
         }
     }
     return slot;
+}
+
+static int DetectLevelSlot() {
+    ScreenShot shot;
+    return DetectLevelSlotFromCaptured(CaptureScreen(shot) ? &shot : nullptr);
 }
 
 static bool UpdateObservedLevelSlot(int detectedSlot, bool* changed = nullptr, bool initialIsChange = false) {
@@ -1215,6 +1296,8 @@ static void StopCapture() {
     g.running = false;
     g.minigameVisible = false;
     g.message = L"Stopped";
+    g.minigameGeometry = {};
+    g.circlesReady = false;
     KillTimer(g.mainWnd, TIMER_ID);
     SetWindowTextW(g.btnStart, L"Start");
     InvalidateRect(g.overlayWnd, nullptr, TRUE);
@@ -1364,8 +1447,11 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void OnTimer() {
     if (!g.running) return;
     bool detectBlue = !g.tracker.targetReady;
+    ScreenShot ingameShot;
+    const bool capturedIngame = CaptureScreen(ingameShot);
     bool levelChanged = false;
-    UpdateObservedLevelSlot(DetectLevelSlot(), &levelChanged, AwaitingFinalSubmitResult());
+    UpdateObservedLevelSlot(DetectLevelSlotFromCaptured(capturedIngame ? &ingameShot : nullptr),
+                            &levelChanged, AwaitingFinalSubmitResult());
     if (levelChanged) {
         ++g.frameCount;
         ClearLevelState(L"Next level");
@@ -1374,12 +1460,7 @@ static void OnTimer() {
         UpdateStatus();
         return;
     }
-    bool checkMinigame = !g.circlesReady || (!detectBlue && (g.frameCount % kMinigameCheckIntervalFrames) == 0);
-    if (checkMinigame) {
-        g.minigameVisible = IsMinigamePageVisible();
-    } else {
-        g.minigameVisible = true;
-    }
+    g.minigameVisible = CheckMinigamePage(capturedIngame ? &ingameShot : nullptr);
     if (!g.minigameVisible) {
         ++g.frameCount;
         ClearRuntimeState(L"Not in minigame");
@@ -1548,12 +1629,49 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 
-bool DetectInGame() { return IsMinigamePageVisible(); }
+bool DetectInGame() {
+  ScreenShot shot;
+  if (!CaptureScreen(shot)) {
+    ResetInGameCache();
+    return false;
+  }
+  MinigameGeometry geometry;
+  if (!AnalyzeMinigamePage(shot, &geometry)) {
+    ResetInGameCache();
+    return false;
+  }
+  g.minigameGeometry = geometry;
+  if (!AutoLocateRoiFromShot(shot)) {
+    ResetInGameCache();
+    return false;
+  }
+  return true;
+}
+void ResetInGameCache() {
+  g.minigameGeometry = {};
+  g.circlesReady = false;
+}
 HWND OverlayWindow() { return g.overlayWnd; }
 void SetOverlayWindow(HWND hwnd) { g.overlayWnd = hwnd; }
 LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) { return OverlayProc(hwnd, msg, wp, lp); }
 void HideOverlay() { if (g.overlayWnd) ShowWindow(g.overlayWnd, SW_HIDE); }
-void ResetForSession() { g.thresholdPct = 8; g.running = true; g.frameCount = 0; g.detectedCount = 0; ClearRuntimeState(L"Locating"); g.minigameVisible = true; }
+void ResetForSession() {
+  const bool keepLocation = g.minigameGeometry.valid && g.circlesReady;
+  const MinigameGeometry geometry = g.minigameGeometry;
+  const auto circles = g.circles;
+  const int roiX = g.roiX, roiY = g.roiY, roiW = g.roiW, roiH = g.roiH;
+  const int searchX = g.searchX, searchY = g.searchY, searchSize = g.searchSize;
+  g.thresholdPct = 8; g.running = true; g.frameCount = 0; g.detectedCount = 0;
+  ClearRuntimeState(L"Locating");
+  if (keepLocation) {
+    g.minigameGeometry = geometry;
+    g.circles = circles;
+    g.roiX = roiX; g.roiY = roiY; g.roiW = roiW; g.roiH = roiH;
+    g.searchX = searchX; g.searchY = searchY; g.searchSize = searchSize;
+    g.circlesReady = true;
+  }
+  g.minigameVisible = true;
+}
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<bool()>& overlayEnabled,
                 const std::function<void(const std::wstring&)>& status) {
@@ -1574,7 +1692,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
     }
   };
   ResetForSession();
-  AutoLocateRoi();
+  if (!g.circlesReady) AutoLocateRoi();
   syncOverlay();
   int lostFrames = 0;
   bool completedAnyLevel = false;
@@ -1584,8 +1702,11 @@ bool RunSession(const std::function<bool()>& stopRequested,
     CaptureResult capture;
     bool detectBlue = !g.tracker.targetReady;
     syncOverlay();
+    ScreenShot ingameShot;
+    const bool capturedIngame = CaptureScreen(ingameShot);
     bool levelChanged = false;
-    UpdateObservedLevelSlot(DetectLevelSlot(), &levelChanged, AwaitingFinalSubmitResult());
+    UpdateObservedLevelSlot(DetectLevelSlotFromCaptured(capturedIngame ? &ingameShot : nullptr),
+                            &levelChanged, AwaitingFinalSubmitResult());
     if (levelChanged) {
       completedAnyLevel = true;
       setStatus(L"flashing: next level");
@@ -1594,12 +1715,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
       Sleep(0);
       continue;
     }
-    bool checkMinigame = !g.circlesReady || (g.frameCount % kMinigameCheckIntervalFrames) == 0;
-    if (checkMinigame) {
-      g.minigameVisible = IsMinigamePageVisible();
-    } else {
-      g.minigameVisible = true;
-    }
+    g.minigameVisible = CheckMinigamePage(capturedIngame ? &ingameShot : nullptr);
     if (!g.minigameVisible) {
       if (++lostFrames >= 15) {
         setStatus(L"flashing: exited");
@@ -1662,6 +1778,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
   }
   g.running = false;
   HideOverlay();
+  g.minigameGeometry = {};
+  g.circlesReady = false;
   return completedAnyLevel;
 }
 

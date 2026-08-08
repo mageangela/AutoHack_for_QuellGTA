@@ -1,4 +1,3 @@
-#define NOMINMAX
 #include "game_window.h"
 
 #include <tlhelp32.h>
@@ -17,6 +16,7 @@ std::mutex gMutex;
 HWND gWindow = nullptr;
 RECT gClientRect{};
 bool gHasClientRect = false;
+std::uint64_t gWindowGeneration = 1;
 
 bool ReadClientRect(HWND window, RECT& rect) {
   if (!window || !IsWindow(window) || !IsWindowVisible(window) || IsIconic(window)) return false;
@@ -27,6 +27,28 @@ bool ReadClientRect(HWND window, RECT& rect) {
   if (!ClientToScreen(window, &topLeft) || !ClientToScreen(window, &bottomRight)) return false;
   rect = {topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
   return rect.right > rect.left && rect.bottom > rect.top;
+}
+
+bool SameRect(const RECT& a, const RECT& b) {
+  return a.left == b.left && a.top == b.top &&
+         a.right == b.right && a.bottom == b.bottom;
+}
+
+bool RefreshWindowLocked() {
+  RECT current{};
+  if (!gWindow || !ReadClientRect(gWindow, current)) {
+    if (gWindow || gHasClientRect) ++gWindowGeneration;
+    gWindow = nullptr;
+    gClientRect = {};
+    gHasClientRect = false;
+    return false;
+  }
+  if (!gHasClientRect || !SameRect(current, gClientRect)) {
+    gClientRect = current;
+    gHasClientRect = true;
+    ++gWindowGeneration;
+  }
+  return true;
 }
 
 std::unordered_set<DWORD> FindGameProcesses() {
@@ -74,27 +96,36 @@ bool FindGameWindow() {
   const auto processes = FindGameProcesses();
   if (processes.empty()) {
     std::lock_guard<std::mutex> lock(gMutex);
+    if (gWindow || gHasClientRect) ++gWindowGeneration;
     gWindow = nullptr;
+    gClientRect = {};
     gHasClientRect = false;
     return false;
   }
   WindowSearch search{&processes};
   EnumWindows(FindWindowCallback, reinterpret_cast<LPARAM>(&search));
   std::lock_guard<std::mutex> lock(gMutex);
-  gWindow = search.best;
-  gHasClientRect = ReadClientRect(gWindow, gClientRect);
+  RECT nextRect{};
+  const bool found = ReadClientRect(search.best, nextRect);
+  if (!found || search.best != gWindow || !gHasClientRect || !SameRect(nextRect, gClientRect)) {
+    ++gWindowGeneration;
+  }
+  gWindow = found ? search.best : nullptr;
+  gClientRect = found ? nextRect : RECT{};
+  gHasClientRect = found;
   return gHasClientRect;
 }
 
 bool GetGameClientRect(RECT& rect) {
   std::lock_guard<std::mutex> lock(gMutex);
-  if (!gHasClientRect) return false;
+  if (!RefreshWindowLocked()) return false;
   rect = gClientRect;
   return true;
 }
 
 void ClearGameWindow() {
   std::lock_guard<std::mutex> lock(gMutex);
+  if (gWindow || gHasClientRect) ++gWindowGeneration;
   gWindow = nullptr;
   gClientRect = {};
   gHasClientRect = false;
@@ -148,8 +179,16 @@ thread_local CaptureResources gCapture;
 
 bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion) {
   RECT client{};
-  if (!GetGameClientRect(client)) return false;
-  return CaptureGameFrameFromClientRect(frame, client, screenRegion);
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!RefreshWindowLocked()) return false;
+    client = gClientRect;
+    generation = gWindowGeneration;
+  }
+  if (!CaptureGameFrameFromClientRect(frame, client, screenRegion)) return false;
+  frame.windowGeneration = generation;
+  return true;
 }
 
 bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const RECT* screenRegion) {
@@ -192,6 +231,7 @@ bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const 
   frame.width = width;
   frame.height = height;
   frame.clientHeight = clientH;
+  frame.clientWidth = client.right - client.left;
   frame.captureQpc = capturedAt.QuadPart;
   frame.toScreenX = sourceW / static_cast<double>(width);
   frame.toScreenY = sourceH / static_cast<double>(height);
